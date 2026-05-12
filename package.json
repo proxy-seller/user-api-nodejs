@@ -1,0 +1,22 @@
+{
+    "name": "proxy-seller-user-api",
+    "version": "1.8.0",
+    "description": "Interaction with user api",
+    "main": "index.js",
+    "type": "module",
+    "scripts": {
+        "debug": "node debug.js",
+        "test": "echo \"Error: no test specified\" && exit 1"
+    },
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/proxy-seller/user-api-nodejs.git"
+    },
+    "homepage": "https://github.com/proxy-seller/user-api-nodejs",
+    "keywords": [],
+    "author": "proxy-seller",
+    "license": "MIT",
+    "dependencies": {
+        "axios": "^1.4.0"
+    }
+}
