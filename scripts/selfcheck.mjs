@@ -110,6 +110,64 @@ await check('assertTargetName: mix_isp без признаков требует 
 await check('assertTargetName: пустая строка в цели не считается заполненной', () =>
     expectApiError(() => api.assertTargetName({ sectionCode: 'ipv4', customTargetName: '   ' })));
 
+/////////////////////////////// примеры из README ///////////////////////////////
+
+// Коды уходят ПОЗИЦИОННО в *Id: сервер (normalizeOrderReferenceCodes) резолвит значение как
+// код, если это не валидный ObjectId и парный *Code пуст. Цепочки null и options ради кодов
+// не нужны — эти проверки фиксируют именно те вызовы, что показаны в README.
+await check('README: ipv4 позиционно с кодами и целью', () => {
+    const local = new ProxySellerUserApi({ key: 'K' });
+    local.setPaymentId('PAYMENT_SYSTEM_OBJECT_ID');
+    const payload = local.prepareRegular('ipv4', 'USA', '1m', 2, null, null, 'scraping');
+    local.assertTargetName(payload);
+    assertEqual(payload, {
+        paymentId: 'PAYMENT_SYSTEM_OBJECT_ID', sectionCode: 'ipv4', countryId: 'USA',
+        periodId: '1m', quantity: 2, customTargetName: 'scraping'
+    });
+});
+
+await check('README: ipv4 без цели падает локально (старый пример был сломан)', () =>
+    expectApiError(
+        () => api.assertTargetName(api.prepareRegular('ipv4', { countryCode: 'USA', periodCode: '1m', quantity: 2 })),
+        'customTargetName is required'
+    ));
+
+// rotationId — МИНУТЫ (0 = By Link), а не код: '5m'/'10m' сервер отвергает
+// ("Set existed [rotationCode] from reference"), потому что rotationCode проверяется isInteger().
+await check('README: mobile позиционно, rotationId числом', () => {
+    const local = new ProxySellerUserApi({ key: 'K' });
+    local.setPaymentId('PAYMENT_SYSTEM_OBJECT_ID');
+    assertEqual(
+        local.prepareMobile('USA', '1m', 1, null, null, 'OPERATOR_ID', 10),
+        {
+            paymentId: 'PAYMENT_SYSTEM_OBJECT_ID', sectionCode: 'mobile', countryId: 'USA',
+            periodId: '1m', quantity: 1, operatorId: 'OPERATOR_ID', rotationId: 10,
+            mobileServiceType: 'dedicated'
+        }
+    );
+});
+
+await check('README: rotationId=0 (By Link) не отбрасывается как пустое', () => {
+    const payload = api.prepareMobile('USA', '1m', 1, null, null, 'OPERATOR_ID', 0, 'shared');
+    assertEqual(payload.rotationId, 0, 'rotationId=0 must survive');
+    assertEqual(payload.mobileServiceType, 'shared', 'mobileServiceType lost');
+});
+
+await check('README: mix принимает и id пакета, и его tag', () => {
+    for (const identifier of ['MIX_ID', 'mix-us-eu']) {
+        const payload = api.prepareMix(identifier, '1m', 1);
+        api.assertTargetName(payload);
+        assertEqual(payload.mixId, identifier, 'mixId lost');
+    }
+});
+
+await check('README: prolong позиционно с кодом периода', () => {
+    assertEqual(
+        api.prepareProlong(['ORDER_ID'], '1m', 'SALE10'),
+        { ids: ['ORDER_ID'], periodId: '1m', coupon: 'SALE10' }
+    );
+});
+
 /////////////////////////////// _deleteResult ///////////////////////////////
 
 await check('_deleteResult: строка "delete" -> {status}', () => {

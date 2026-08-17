@@ -78,7 +78,9 @@ class ProxySellerUserApi {
     }
 
     /**
-     * Payment system id (MongoDB ObjectId from balance/payments/list)
+     * Payment system id (MongoDB ObjectId from balance/payments/list).
+     * For order/* and prolong/* a stable payment code is accepted here too — the server retries the
+     * value as a code when it is not a valid id. balance/add takes the ObjectId only.
      * @param string id
      */
     setPaymentId(id) {
@@ -89,7 +91,11 @@ class ProxySellerUserApi {
         return this.paymentId
     }
 
-    /** Stable payment-system code (for example `balance`). */
+    /**
+     * Stable payment-system code (for example `balance`). Resolved by order/* and prolong/* only —
+     * balance/add needs setPaymentId(). balance/payments/list returns id + name, no code, so the
+     * codes are not discoverable through the API.
+     */
     setPaymentCode(code) {
         this.paymentCode = code
     }
@@ -253,6 +259,16 @@ class ProxySellerUserApi {
     /**
      * Merge optional v2 order identifiers/codes without sending conflicting pairs.
      * Explicit per-call values take precedence over values configured on the client.
+     *
+     * countryId / periodId / paymentId / operatorId / mixId / tarifId accept an ObjectId OR the
+     * corresponding stable code: normalizeOrderReferenceCodes on the server retries the value as
+     * a code whenever it is not a valid id and the paired *Code field is empty. The separate
+     * *Code fields are therefore optional, not the only way to pass a code.
+     *
+     * rotationId is NOT an id and has NO code: it is the rotation interval in minutes
+     * (0 = By Link, 5, 10, 60...). rotationCode is only copied into rotationId after an
+     * isInteger() check, so '5m' / '10m' are always rejected with
+     * "Set existed [rotationCode] from reference".
      */
     mergeOrderOptions(payload, options = {}) {
         const allowed = [
@@ -511,7 +527,21 @@ class ProxySellerUserApi {
     /////////////////////////////// Order ///////////////////////////////
 
     /**
-     * Necessary guides for creating an order
+     * Necessary guides for creating an order.
+     *
+     * Что реально приходит (и чего НЕ приходит — на это нельзя рассчитывать):
+     *   country[]           id, name, alpha3            -> alpha3 = код страны, есть
+     *   period[]            id, name                    -> кода периода НЕТ
+     *   mobile country[]    id, name, operators{...}     -> у оператора только id и name, отдельного
+     *                                                      поля с тегом нет (в fallback-ветке
+     *                                                      бэкенда в id лежит сам тег; operatorId
+     *                                                      принимает и то, и другое)
+     *   operators[].rotations[]  id = МИНУТЫ, name       -> "5 minutes", 0 = "By Link"
+     *   mix country[]       id, name, alpha3=null, tag   -> tag = mixCode, есть
+     *   mix quantities[]    id, name, quantities[]       -> тега здесь НЕТ
+     *   resident tarifs[]   id, name, personal           -> кода тарифа НЕТ
+     * Платёжные системы лежат отдельно, в balancePaymentsList(): id, name, кода тоже НЕТ.
+     *
      * @param string type - ipv4 | ipv6 | mobile | isp | mix | resident | null
      * @return object
      */
@@ -563,6 +593,17 @@ class ProxySellerUserApi {
         }, options);
     }
 
+    /**
+     * @param {string|object} countryId ObjectId or country code (alpha3, e.g. 'USA'); object = whole payload
+     * @param {string} periodId ObjectId or period code (e.g. '1m')
+     * @param {number} quantity
+     * @param {string} authorization
+     * @param {string} coupon
+     * @param {string} operatorId ObjectId or operator tag
+     * @param {number} rotationId rotation interval in MINUTES (0 = By Link, 5, 10, 60...), never a code
+     * @param {string} mobileServiceType dedicated | shared
+     * @param {object} options fields with no positional slot (paymentId/paymentCode, *Code, ...)
+     */
     prepareMobile(countryId, periodId, quantity, authorization, coupon, operatorId, rotationId,
         mobileServiceType = 'dedicated', options = {}) {
         if (countryId && typeof countryId === 'object' && !Array.isArray(countryId)) {
@@ -711,40 +752,82 @@ class ProxySellerUserApi {
     }
 
     /**
-     * Calculate the order IPv4. countryId/periodId accept an ObjectId or a stable code.
+     * Calculate the order IPv4.
+     * @param {string|object} countryId ObjectId or country code (alpha3, e.g. 'USA'); object = whole payload
+     * @param {string} periodId ObjectId or period code (e.g. '1m')
+     * @param {number} quantity
+     * @param {string} authorization
+     * @param {string} coupon
+     * @param {string} customTargetName required for ipv4 (server answers "Incorrect goal", code 14)
+     * @param {object} options fields with no positional slot: uptime, paymentId/paymentCode, ...
      */
     async orderCalcIpv4(countryId, periodId = null, quantity = null, authorization = null, coupon = null, customTargetName = null, options = {}) {
         return this.orderCalc(this.prepareRegular('ipv4', countryId, periodId, quantity, authorization, coupon, customTargetName, options));
     }
 
     /**
-     * Calculate the order ISP. countryId/periodId accept an ObjectId or a stable code.
+     * Calculate the order ISP.
+     * @param {string|object} countryId ObjectId or country code (alpha3, e.g. 'USA'); object = whole payload
+     * @param {string} periodId ObjectId or period code (e.g. '1m')
+     * @param {number} quantity
+     * @param {string} authorization
+     * @param {string} coupon
+     * @param {string} customTargetName required for isp (server answers "Incorrect goal", code 14)
+     * @param {object} options fields with no positional slot: uptime, paymentId/paymentCode, ...
      */
     async orderCalcIsp(countryId, periodId = null, quantity = null, authorization = null, coupon = null, customTargetName = null, options = {}) {
         return this.orderCalc(this.prepareRegular('isp', countryId, periodId, quantity, authorization, coupon, customTargetName, options));
     }
 
     /**
-     * Calculate the order MIX. The first legacy positional argument is a MIX id,
-     * not a country id. Pass {mixCode, periodCode, ...} for code-first calls.
+     * Calculate the order MIX. The first positional argument is a MIX package identifier,
+     * not a country id.
+     * @param {string|object} mixId package ObjectId or its tag (mixCode); object = whole payload
+     * @param {string} periodId ObjectId or period code (e.g. '1m')
+     * @param {number} quantity
+     * @param {string} authorization
+     * @param {string} coupon
+     * @param {string} customTargetName only needed when the MIX package cannot be resolved
+     * @param {object} options fields with no positional slot: paymentId/paymentCode, mixCode, ...
      */
     async orderCalcMix(mixId, periodId = null, quantity = null, authorization = null, coupon = null, customTargetName = null, options = {}) {
         return this.orderCalc(this.prepareMix(mixId, periodId, quantity, authorization, coupon, customTargetName, options));
     }
 
+    /**
+     * Same as orderCalcMix() with the identifiers sent in the explicit mixCode/periodCode fields.
+     * orderCalcMix('mix-us-eu', '1m', 1) does the same job through the *Id fallback.
+     */
     async orderCalcMixByCode(mixCode, periodCode, quantity, options = {}) {
         return this.orderCalcMix({ ...options, mixCode: mixCode, periodCode: periodCode, quantity: quantity });
     }
 
     /**
-     * Calculate the order IPv6
+     * Calculate the order IPv6.
+     * @param {string|object} countryId ObjectId or country code (alpha3, e.g. 'USA'); object = whole payload
+     * @param {string} periodId ObjectId or period code (e.g. '1m')
+     * @param {number} quantity
+     * @param {string} authorization
+     * @param {string} coupon
+     * @param {string} customTargetName required for ipv6 (server answers "Incorrect goal", code 14)
+     * @param {string} protocol
+     * @param {object} options fields with no positional slot: paymentId/paymentCode, ...
      */
     async orderCalcIpv6(countryId, periodId = null, quantity = null, authorization = null, coupon = null, customTargetName = null, protocol = null, options = {}) {
         return this.orderCalc(this.prepareIpv6(countryId, periodId, quantity, authorization, coupon, customTargetName, protocol, options));
     }
 
     /**
-     * Calculate the order Mobile
+     * Calculate the order Mobile.
+     * @param {string|object} countryId ObjectId or country code (alpha3, e.g. 'USA'); object = whole payload
+     * @param {string} periodId ObjectId or period code (e.g. '1m')
+     * @param {number} quantity
+     * @param {string} authorization
+     * @param {string} coupon
+     * @param {string} operatorId ObjectId or operator tag
+     * @param {number} rotationId rotation interval in MINUTES (0 = By Link, 5, 10, 60...), never a code
+     * @param {string} mobileServiceType dedicated | shared
+     * @param {object} options fields with no positional slot: paymentId/paymentCode, ...
      */
     async orderCalcMobile(countryId, periodId = null, quantity = null, authorization = null, coupon = null,
         operatorId = null, rotationId = null, mobileServiceType = 'dedicated', options = {}) {
@@ -755,7 +838,10 @@ class ProxySellerUserApi {
     }
 
     /**
-     * Calculate the order Resident
+     * Calculate the order Resident.
+     * @param {string|object} tarifId tariff ObjectId or its code; object = whole payload
+     * @param {string} coupon
+     * @param {object} options fields with no positional slot: paymentId/paymentCode, tarifCode, ...
      */
     async orderCalcResident(tarifId, coupon = null, options = {}) {
         return this.orderCalc(this.prepareResident(tarifId, coupon, options));
@@ -763,6 +849,13 @@ class ProxySellerUserApi {
 
     /**
      * Create an order IPv4. Attention! Deducts money from the balance.
+     * @param {string|object} countryId ObjectId or country code (alpha3, e.g. 'USA'); object = whole payload
+     * @param {string} periodId ObjectId or period code (e.g. '1m')
+     * @param {number} quantity
+     * @param {string} authorization
+     * @param {string} coupon
+     * @param {string} customTargetName required for ipv4 (server answers "Incorrect goal", code 14)
+     * @param {object} options fields with no positional slot: uptime, paymentId/paymentCode, ...
      */
     async orderMakeIpv4(countryId, periodId = null, quantity = null, authorization = null, coupon = null, customTargetName = null, options = {}) {
         return this.orderMake(this.withGenerateAuth(this.prepareRegular('ipv4', countryId, periodId, quantity, authorization, coupon, customTargetName, options)));
@@ -770,6 +863,13 @@ class ProxySellerUserApi {
 
     /**
      * Create an order ISP. Attention! Deducts money from the balance.
+     * @param {string|object} countryId ObjectId or country code (alpha3, e.g. 'USA'); object = whole payload
+     * @param {string} periodId ObjectId or period code (e.g. '1m')
+     * @param {number} quantity
+     * @param {string} authorization
+     * @param {string} coupon
+     * @param {string} customTargetName required for isp (server answers "Incorrect goal", code 14)
+     * @param {object} options fields with no positional slot: uptime, paymentId/paymentCode, ...
      */
     async orderMakeIsp(countryId, periodId = null, quantity = null, authorization = null, coupon = null, customTargetName = null, options = {}) {
         return this.orderMake(this.withGenerateAuth(this.prepareRegular('isp', countryId, periodId, quantity, authorization, coupon, customTargetName, options)));
@@ -777,17 +877,36 @@ class ProxySellerUserApi {
 
     /**
      * Create an order MIX. Attention! Deducts money from the balance.
+     * @param {string|object} mixId package ObjectId or its tag (mixCode); object = whole payload
+     * @param {string} periodId ObjectId or period code (e.g. '1m')
+     * @param {number} quantity
+     * @param {string} authorization
+     * @param {string} coupon
+     * @param {string} customTargetName only needed when the MIX package cannot be resolved
+     * @param {object} options fields with no positional slot: paymentId/paymentCode, mixCode, ...
      */
     async orderMakeMix(mixId, periodId = null, quantity = null, authorization = null, coupon = null, customTargetName = null, options = {}) {
         return this.orderMake(this.withGenerateAuth(this.prepareMix(mixId, periodId, quantity, authorization, coupon, customTargetName, options)));
     }
 
+    /**
+     * Same as orderMakeMix() with the identifiers sent in the explicit mixCode/periodCode fields.
+     * orderMakeMix('mix-us-eu', '1m', 1) does the same job through the *Id fallback.
+     */
     async orderMakeMixByCode(mixCode, periodCode, quantity, options = {}) {
         return this.orderMakeMix({ ...options, mixCode: mixCode, periodCode: periodCode, quantity: quantity });
     }
 
     /**
      * Create an order IPv6. Attention! Deducts money from the balance.
+     * @param {string|object} countryId ObjectId or country code (alpha3, e.g. 'USA'); object = whole payload
+     * @param {string} periodId ObjectId or period code (e.g. '1m')
+     * @param {number} quantity
+     * @param {string} authorization
+     * @param {string} coupon
+     * @param {string} customTargetName required for ipv6 (server answers "Incorrect goal", code 14)
+     * @param {string} protocol
+     * @param {object} options fields with no positional slot: paymentId/paymentCode, ...
      */
     async orderMakeIpv6(countryId, periodId = null, quantity = null, authorization = null, coupon = null, customTargetName = null, protocol = null, options = {}) {
         return this.orderMake(this.withGenerateAuth(this.prepareIpv6(countryId, periodId, quantity, authorization, coupon, customTargetName, protocol, options)));
@@ -795,6 +914,15 @@ class ProxySellerUserApi {
 
     /**
      * Create an order Mobile. Attention! Deducts money from the balance.
+     * @param {string|object} countryId ObjectId or country code (alpha3, e.g. 'USA'); object = whole payload
+     * @param {string} periodId ObjectId or period code (e.g. '1m')
+     * @param {number} quantity
+     * @param {string} authorization
+     * @param {string} coupon
+     * @param {string} operatorId ObjectId or operator tag
+     * @param {number} rotationId rotation interval in MINUTES (0 = By Link, 5, 10, 60...), never a code
+     * @param {string} mobileServiceType dedicated | shared
+     * @param {object} options fields with no positional slot: paymentId/paymentCode, ...
      */
     async orderMakeMobile(countryId, periodId = null, quantity = null, authorization = null, coupon = null,
         operatorId = null, rotationId = null, mobileServiceType = 'dedicated', options = {}) {
@@ -806,6 +934,9 @@ class ProxySellerUserApi {
 
     /**
      * Create an order Resident. Attention! Deducts money from the balance.
+     * @param {string|object} tarifId tariff ObjectId or its code; object = whole payload
+     * @param {string} coupon
+     * @param {object} options fields with no positional slot: paymentId/paymentCode, tarifCode, ...
      */
     async orderMakeResident(tarifId, coupon = null, options = {}) {
         return this.orderMake(this.prepareResident(tarifId, coupon, options));
@@ -844,9 +975,10 @@ class ProxySellerUserApi {
     /**
      * Calculate the renewal
      * @param string type - ipv4 | ipv6 | mobile | isp | mix
-     * @param array ids
-     * @param string periodId
+     * @param {array|object} ids order ids; object = whole payload (orderSeparatorId(s) live there)
+     * @param {string} periodId ObjectId or period code (e.g. '1m') — prolong runs the same fallback
      * @param string coupon
+     * @param {object} options fields with no positional slot: orderSeparatorIds, paymentId/paymentCode
      * @return object
      */
     async prolongCalc(type, ids, periodId = null, coupon = '', options = {}) {
@@ -858,8 +990,8 @@ class ProxySellerUserApi {
     /**
      * Create a renewal order. Attention! Deducts money from the balance.
      * @param string type - ipv4 | ipv6 | mobile | isp | mix
-     * @param array ids
-     * @param string periodId
+     * @param {array|object} ids order ids; object = whole payload (orderSeparatorId(s) live there)
+     * @param {string} periodId ObjectId or period code (e.g. '1m') — prolong runs the same fallback
      * @param string coupon
      * @return object {orderId, total, balance, listBaseOrderNumbers}
      * @throws ApiError при нехватке средств — продление НЕ состоялось

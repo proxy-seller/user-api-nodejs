@@ -37,15 +37,71 @@ and headers authoritative.
 Every id in v2 is a MongoDB ObjectId **string** (`"665f1c…"`), not a number. Never parse an
 id into `Number`/`parseInt` — that silently produces `NaN` or a truncated value. This applies
 to `orderId`, order/prolong ids, payment system ids, auth ids, IP address ids, country, period,
-mix, operator, rotation and tariff ids. Numeric v1 ids do not resolve in v2 at all.
+mix, operator and tariff ids. Numeric v1 ids do not resolve in v2 at all.
 
-The one exception: **resident list ids are numeric** (`Long`) — `residentList()`,
-`residentListRename()`, `residentListRotation()`, `residentListDelete()`, the `listId` /
-`id` parameter of the resident export. They are not ObjectIds.
+Two things are **not** ObjectIds:
 
-Where an id has a stable counterpart, the SDK accepts a code instead (`countryCode`,
-`periodCode`, `paymentCode`, `mixCode`, `operatorCode`, `rotationCode`, `tarifCode`) —
-see `referenceList()`. Codes are resolved server side for `order/*` and `prolong/*` only.
+- **resident list ids are numeric** (`Long`) — `residentList()`, `residentListRename()`,
+  `residentListRotation()`, `residentListDelete()`, the `listId` / `id` parameter of the
+  resident export;
+- **`rotationId` is an interval in minutes**, not an id at all — see below.
+
+## Codes go into the `*Id` argument
+
+Codes are resolved server side for `order/*` and `prolong/*` only, and they are resolved
+**inside the `*Id` field itself**: if the value in `countryId`, `periodId`, `paymentId`,
+`operatorId`, `mixId` or `tarifId` is not a valid ObjectId *and* the matching `*Code` field is
+empty, the server retries the same value as a code
+(`ClientApiService.normalizeOrderReferenceCodes`).
+
+So a code goes straight into the positional argument — there is no need for a chain of `null`s
+followed by an options object:
+
+```js
+// A code in the id slot. Positional, no options object.
+await api.orderCalcIpv4('USA', '1m', 2, null, null, 'scraping');
+
+// Mobile: country code, period code, operator id/tag, rotation in minutes.
+await api.orderCalcMobile('USA', '1m', 1, null, null, 'OPERATOR_ID', 5);
+```
+
+Case handling of the fallback: `countryId` is upper-cased (so it matches `alpha3`), `periodId`
+is lower-cased, `operatorId` is matched against the operator tag as given, `mixId` must match a
+MIX `tag` exactly, `tarifId` must match a tariff `code` exactly. `paymentId` is matched against
+the payment-system code and against `PaymentSystemTypes` names.
+
+The explicit `*Code` fields (`countryCode`, `periodCode`, `paymentCode`, `mixCode`,
+`operatorCode`, `tarifCode`) still work and are what `orderCalcMixByCode()` /
+`setPaymentCode()` use. But reach for the options object only for fields the positional
+signature does not cover — `uptime` on ipv4/isp, `orderSeparatorIds` on prolong — not merely to
+carry a code. Everything else already has a slot: `protocol` in the ipv6 helpers,
+`mobileServiceType` and `rotationId` in the mobile ones.
+
+### `rotationId` is minutes, not a code
+
+`rotationId` is the only reference field with **no** code fallback, and it is not an id either —
+it is the rotation interval in **minutes**, as an integer: `0` = *By Link*, `5`, `10`, `60`…
+`rotationCode` exists in the request DTO, but the server only checks that it is an integer and
+copies it into `rotationId`; nothing is looked up. A value such as `'5m'` or `'10m'` is therefore
+always rejected with `Set existed [rotationCode] from reference`. Pass the number
+(`5`, `10`, `0`) into `rotationId`, and skip `rotationCode` — it buys nothing.
+
+### What `referenceList()` actually returns
+
+Only two codes are actually discoverable through the API: the country `alpha3` and the MIX
+package `tag`. Everywhere else the response carries an `id` and nothing else — the server-side
+fallback does accept a code there, but you cannot learn that code from the API, so do not build
+a client that expects one.
+
+| you need | `referenceList()` gives | pass |
+|---|---|---|
+| country | `country[]`: `id`, `name`, `alpha3` | `alpha3` (`"USA"`) or `id` |
+| period | `period[]`: `id`, `name` — **no code** | `id`. Codes like `"1m"` resolve only because the server knows them; they are not in the response |
+| mobile operator | `mobile.country[].operators.{dedicated,shared}[]`: `id`, `name`, `rotations[]` — **no tag field** | that `id` as it comes (it is an ObjectId, or the operator tag on the fallback branch — `operatorId` accepts both) |
+| rotation | `operators[].rotations[]`: `id` = minutes, `name` = `"5 minutes"` / `"By Link"` | that `id`, as a number, in `rotationId` |
+| MIX package | `mix.country[]` / `mix_isp.country[]`: `id`, `name`, `tag`; `mix.quantities[]`: `id`, `name`, `quantities[]` | `id` as `mixId`, or `tag` as `mixCode`. The `quantities[]` entries carry no tag |
+| resident tariff | `resident.tarifs[]`: `id`, `name`, `personal` — **no code** | `id` |
+| payment system | `balancePaymentsList()`: `id`, `name` — **no code** | `id`. `"balance"` works as a code only because the server also matches payment-system type names |
 
 ## Error handling
 
@@ -87,26 +143,36 @@ locally to avoid it (max 250 chars, no CR, LF, `/` or `\`).
 
 ## Orders
 
-Legacy positional ID calls remain supported. New code-first calls use one options
-object. Stable codes come from `referenceList()`.
+Positional calls take an ObjectId **or** a code in the same argument (see above), so the
+ordinary call is positional. The object form exists for payloads that do not fit the
+positional signature.
 
 ```js
-api.setPaymentCode('balance'); // or setPaymentId('...')
+api.setPaymentId('PAYMENT_SYSTEM_OBJECT_ID'); // or setPaymentCode('balance')
 
-await api.orderCalcIpv4({
-  countryCode: 'USA', periodCode: '1m', quantity: 2, uptime: true
-});
+// countryId='USA' (alpha3), periodId='1m', customTargetName is required for ipv4:
+await api.orderCalcIpv4('USA', '1m', 2, null, null, 'scraping');
 
-await api.orderMakeMobile({
-  countryCode: 'USA', periodCode: '1m', quantity: 1,
-  mobileServiceType: 'dedicated', operatorCode: 'operator-code',
-  rotationCode: '10m'
-});
+// uptime has no positional slot — this is what the options object is for:
+await api.orderCalcIpv4('USA', '1m', 2, null, null, 'scraping', { uptime: true });
 
-// MIX uses a package identifier, not countryId:
-await api.orderCalcMix('MIX_ID', 'PERIOD_ID', 1);
-await api.orderCalcMixByCode('mix-us-eu', '1m', 1);
+// Mobile: (countryId, periodId, quantity, authorization, coupon, operatorId, rotationId,
+// mobileServiceType). rotationId is MINUTES — 10, not '10m'. mobileServiceType defaults
+// to 'dedicated', pass 'shared' explicitly when you need it.
+await api.orderMakeMobile('USA', '1m', 1, null, null, 'OPERATOR_ID', 10);
+await api.orderMakeMobile('USA', '1m', 1, null, null, 'OPERATOR_ID', 0, 'shared');
+
+// MIX takes a package identifier, not a countryId. Both the package id and its tag work:
+await api.orderCalcMix('MIX_ID', '1m', 1);
+await api.orderCalcMix('mix-us-eu', '1m', 1);
+await api.orderCalcMixByCode('mix-us-eu', '1m', 1); // explicit mixCode/periodCode
+
+// Resident: tarifId accepts the tariff ObjectId or its code.
+await api.orderCalcResident('TARIF_ID');
 ```
+
+The remaining `null`s above are the genuinely optional `authorization` and `coupon`
+arguments — not placeholders for codes.
 
 `mobileServiceType` is required by the API and defaults to legacy-compatible
 `dedicated`. `uptime` is available for supported IPv4/ISP combinations.
@@ -120,13 +186,20 @@ cannot be resolved: passing `mixId`, `mixCode`, `countryId: "packageId:quantity"
 
 ## Prolongation
 
-The object form exposes the complete v2 payload: `ids`, `orderSeparatorId`,
-`orderSeparatorIds`, `periodId`/`periodCode`, `paymentId`/`paymentCode`, and `coupon`.
+`prolong/*` runs the same code fallback as `order/*`, so `periodId` takes a code positionally:
+
+```js
+await api.prolongMake('ipv4', ['ORDER_ID'], '1m', 'SALE10');
+```
+
+The object form exists for the fields with no positional slot — `orderSeparatorId` /
+`orderSeparatorIds` — and exposes the complete v2 payload: `ids`, `orderSeparatorId`,
+`orderSeparatorIds`, `periodId`/`periodCode`, `paymentId`/`paymentCode`, `coupon`.
 
 ```js
 await api.prolongMake('mix', {
   orderSeparatorIds: ['SEPARATOR_ID'],
-  periodCode: '1m', paymentCode: 'balance', coupon: 'SALE10'
+  periodId: '1m', coupon: 'SALE10'
 });
 ```
 
@@ -262,6 +335,10 @@ parts are hierarchical though: `region` needs `country`, `city` needs `region`, 
 `resident/lists` returns `data` as a **flat array** of lists (there is no `items` wrapper),
 and their ids are numeric.
 
+The `rotation` of a resident list is a **different unit** from the mobile `rotationId`: here it
+is **seconds** (`-1` sticky, `0` per request, `1`–`3600`), while the mobile order argument is
+minutes.
+
 `residentTrafficDetails()` expects the package key as **`packageKey`** (alias `key`) — not
 `package_key`; without it the server answers `key is required`. Other filters: `login`,
 `date_start`, `date_end`. `residentConsumption()` takes `login`, `date_start`, `date_end`
@@ -281,7 +358,8 @@ const geo = JSON.parse(Buffer.from(await api.residentGeo()).toString('utf8'));
 
 ## v1 migration notes
 
-- IDs in v2 are strings; old numeric v1 IDs do not resolve. Resident list ids stay numeric.
+- IDs in v2 are strings; old numeric v1 IDs do not resolve. Resident list ids stay numeric,
+  and the mobile `rotationId` stays a number of minutes.
 - `authActive(id, "Y")` became `authChange(id, true)`.
 - `ping()` and `proxyCheck()` have no v2 equivalent.
 - `residentListDelete()` sends the ID in the request body.
