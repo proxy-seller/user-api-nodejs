@@ -1,12 +1,22 @@
 {
     "name": "proxy-seller-user-api",
-    "version": "1.8.0",
+    "version": "2.0.0",
     "description": "Interaction with user api",
     "main": "index.js",
     "type": "module",
+    "exports": {
+        ".": "./index.js"
+    },
+    "files": [
+        "index.js",
+        "README.md",
+        "LICENSE"
+    ],
+    "engines": {
+        "node": ">=18"
+    },
     "scripts": {
-        "debug": "node debug.js",
-        "test": "echo \"Error: no test specified\" && exit 1"
+        "test": "node scripts/selfcheck.mjs"
     },
     "repository": {
         "type": "git",
