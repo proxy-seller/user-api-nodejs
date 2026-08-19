@@ -944,6 +944,43 @@ class ProxySellerUserApi {
 
     /////////////////////////////// Prolong ///////////////////////////////
 
+    /**
+     * Разводит то, что пришло от вызывающего, на адреса и ObjectId.
+     *
+     * Клиенту удобнее продлевать по самим адресам — именно их он видит в proxy/list.
+     * Сервер принимает их в поле ips и сам переводит в ids
+     * (ClientApiService.resolveProlongIpsToIds — безусловно и для calc, и для make).
+     * Адрес содержит точку или двоеточие (ipv4 "ip", ipv6 "host:port",
+     * mobile "ip:portHttp:portSocks"), ObjectId — 24 hex-символа без них, так что
+     * смешанный список тоже работает.
+     * @param {array|string} ipsOrIds
+     * @return {{ips: string[], ids: string[]}}
+     */
+    _splitProlongTargets(ipsOrIds) {
+        const ips = [];
+        const ids = [];
+        let items;
+        if (typeof ipsOrIds === 'string') {
+            items = ipsOrIds.split(',');
+        } else if (Array.isArray(ipsOrIds)) {
+            items = ipsOrIds;
+        } else {
+            return { ips, ids };
+        }
+        for (const item of items) {
+            if (typeof item !== 'string') {
+                ids.push(item);
+                continue;
+            }
+            const value = item.trim();
+            if (!value) {
+                continue;
+            }
+            (value.includes('.') || value.includes(':') ? ips : ids).push(value);
+        }
+        return { ips, ids };
+    }
+
     prepareProlong(ids, periodId, coupon, options = {}) {
         let payload;
         let values;
@@ -951,11 +988,20 @@ class ProxySellerUserApi {
             payload = { ...this.paymentOptions() };
             values = { ...ids, ...options };
         } else {
-            payload = { ...this.paymentOptions(), ids: ids, periodId: periodId, coupon: coupon };
+            const targets = this._splitProlongTargets(ids);
+            const routed = {};
+            if (targets.ips.length || targets.ids.length) {
+                // Пустой ids рядом с ips не ставим: сервер отдаёт приоритет ids.
+                if (targets.ids.length) routed.ids = targets.ids;
+                if (targets.ips.length) routed.ips = targets.ips;
+            } else if (ids != null) {
+                routed.ids = ids;
+            }
+            payload = { ...this.paymentOptions(), ...routed, periodId: periodId, coupon: coupon };
             values = options && typeof options === 'object' && !Array.isArray(options) ? options : {};
         }
         for (const key of [
-            'ids', 'orderSeparatorIds', 'orderSeparatorId', 'coupon',
+            'ids', 'ips', 'orderSeparatorIds', 'orderSeparatorId', 'coupon',
             'periodId', 'periodCode', 'paymentId', 'paymentCode'
         ]) {
             if (Object.prototype.hasOwnProperty.call(values, key)) {
@@ -975,30 +1021,36 @@ class ProxySellerUserApi {
     /**
      * Calculate the renewal
      * @param string type - ipv4 | ipv6 | mobile | isp | mix
-     * @param {array|object} ids order ids; object = whole payload (orderSeparatorId(s) live there)
+     * @param {array|string} ipsOrIds the addresses themselves, exactly as proxy/list returns them:
+     *   '1.2.3.4' for ipv4/isp/mix, 'host:port' for ipv6, 'ip:portHttp:portSocks' for mobile.
+     *   ObjectId strings are accepted too, and a mixed array works — each value is routed by shape.
+     *   An object here is treated as the whole payload instead.
      * @param {string} periodId ObjectId or period code (e.g. '1m') — prolong runs the same fallback
      * @param string coupon
      * @param {object} options fields with no positional slot: orderSeparatorIds, paymentId/paymentCode
      * @return object
      */
-    async prolongCalc(type, ids, periodId = null, coupon = '', options = {}) {
+    async prolongCalc(type, ipsOrIds, periodId = null, coupon = '', options = {}) {
         return this.request('post', 'prolong/calc/' + this._pathSegment(type), {
-            data: this.prepareProlong(ids, periodId, coupon, options)
+            data: this.prepareProlong(ipsOrIds, periodId, coupon, options)
         });
     }
 
     /**
      * Create a renewal order. Attention! Deducts money from the balance.
      * @param string type - ipv4 | ipv6 | mobile | isp | mix
-     * @param {array|object} ids order ids; object = whole payload (orderSeparatorId(s) live there)
+     * @param {array|string} ipsOrIds the addresses themselves, exactly as proxy/list returns them:
+     *   '1.2.3.4' for ipv4/isp/mix, 'host:port' for ipv6, 'ip:portHttp:portSocks' for mobile.
+     *   ObjectId strings are accepted too, and a mixed array works — each value is routed by shape.
+     *   An object here is treated as the whole payload instead.
      * @param {string} periodId ObjectId or period code (e.g. '1m') — prolong runs the same fallback
      * @param string coupon
      * @return object {orderId, total, balance, listBaseOrderNumbers}
      * @throws ApiError при нехватке средств — продление НЕ состоялось
      */
-    async prolongMake(type, ids, periodId = null, coupon = '', options = {}) {
+    async prolongMake(type, ipsOrIds, periodId = null, coupon = '', options = {}) {
         return this._assertProlongMade(await this.request('post', 'prolong/make/' + this._pathSegment(type), {
-            data: this.prepareProlong(ids, periodId, coupon, options)
+            data: this.prepareProlong(ipsOrIds, periodId, coupon, options)
         }));
     }
 

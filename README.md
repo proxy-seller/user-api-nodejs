@@ -13,10 +13,7 @@ import ProxySellerUserApi, { ApiError } from 'proxy-seller-user-api';
 
 const api = new ProxySellerUserApi({
   key: 'YOUR_API_KEY',
-  // Optional root before the API key (useful for local/dev environments):
-  baseUrl: 'https://proxy-seller.com/personal/api/v2/',
-  timeout: 30_000,
-  headers: { 'X-Request-Source': 'my-app' }
+  timeout: 30_000
 });
 
 try {
@@ -28,9 +25,38 @@ try {
 }
 ```
 
-The API key goes into the URL path, not a header. The constructor also accepts Axios
-options. Method-level options are merged safely; the SDK keeps its own URL, method, base URL
-and headers authoritative.
+Nothing else is required — the client talks to `https://proxy-seller.com/personal/api/v2/` by
+default. The API key goes into the URL path, not a header.
+
+### Paying for orders
+
+Every order and renewal needs a payment system. Take one from `balancePaymentsList()` and set it
+once:
+
+```js
+const payments = await api.balancePaymentsList();   // [{ id: '69e7…', name: 'PayPal' }, …]
+api.setPaymentId(payments[0].id);
+```
+
+This is the one place where an id is unavoidable: several payment systems share the same internal
+code (a single `cryptomus` covers "USDT (TRC-20)", "All cryptocurrencies" and more), so the code
+cannot tell them apart. Everywhere else you use human-readable codes.
+
+<details>
+<summary>Pointing the client at another host, and Axios options</summary>
+
+```js
+const api = new ProxySellerUserApi({
+  key: 'YOUR_API_KEY',
+  baseUrl: 'http://localhost:7995/personal/api/v2/',
+  headers: { 'X-Request-Source': 'my-app' }
+});
+```
+
+The constructor also accepts Axios options. Method-level options are merged safely; the SDK keeps
+its own URL, method, base URL and headers authoritative.
+
+</details>
 
 ## IDs in v2 are strings
 
@@ -73,8 +99,7 @@ the payment-system code and against `PaymentSystemTypes` names.
 The explicit `*Code` fields (`countryCode`, `periodCode`, `paymentCode`, `mixCode`,
 `operatorCode`, `tarifCode`) still work and are what `orderCalcMixByCode()` /
 `setPaymentCode()` use. But reach for the options object only for fields the positional
-signature does not cover — `uptime` on ipv4/isp, `orderSeparatorIds` on prolong — not merely to
-carry a code. Everything else already has a slot: `protocol` in the ipv6 helpers,
+signature does not cover — `uptime` on ipv4/isp — not merely to carry a code. Everything else already has a slot: `protocol` in the ipv6 helpers,
 `mobileServiceType` and `rotationId` in the mobile ones.
 
 ### `rotationId` is minutes, not a code
@@ -88,20 +113,21 @@ always rejected with `Set existed [rotationCode] from reference`. Pass the numbe
 
 ### What `referenceList()` actually returns
 
-Only two codes are actually discoverable through the API: the country `alpha3` and the MIX
-package `tag`. Everywhere else the response carries an `id` and nothing else — the server-side
-fallback does accept a code there, but you cannot learn that code from the API, so do not build
-a client that expects one.
+Every field comes back as a readable code. Read it, pass it straight into the request — there is
+no id to look up:
 
 | you need | `referenceList()` gives | pass |
 |---|---|---|
-| country | `country[]`: `id`, `name`, `alpha3` | `alpha3` (`"USA"`) or `id` |
-| period | `period[]`: `id`, `name` — **no code** | `id`. Codes like `"1m"` resolve only because the server knows them; they are not in the response |
-| mobile operator | `mobile.country[].operators.{dedicated,shared}[]`: `id`, `name`, `rotations[]` — **no tag field** | that `id` as it comes (it is an ObjectId, or the operator tag on the fallback branch — `operatorId` accepts both) |
-| rotation | `operators[].rotations[]`: `id` = minutes, `name` = `"5 minutes"` / `"By Link"` | that `id`, as a number, in `rotationId` |
-| MIX package | `mix.country[]` / `mix_isp.country[]`: `id`, `name`, `tag`; `mix.quantities[]`: `id`, `name`, `quantities[]` | `id` as `mixId`, or `tag` as `mixCode`. The `quantities[]` entries carry no tag |
-| resident tariff | `resident.tarifs[]`: `id`, `name`, `personal` — **no code** | `id` |
-| payment system | `balancePaymentsList()`: `id`, `name` — **no code** | `id`. `"balance"` works as a code only because the server also matches payment-system type names |
+| country | `country[]`: `alpha3`, `name` | `alpha3` (`"USA"`) as `countryId` — upper-cased server-side |
+| period | `period[]`: `code`, `name` | `code` (`"1m"`) as `periodId` — lower-cased server-side |
+| mobile operator | `mobile.country[].operators.{dedicated,shared}[]`: `tag`, `name`, `rotations[]` | `tag` as `operatorId` — exact match, case-sensitive |
+| rotation | `operators[].rotations[]`: `id` = minutes, `name` = `"5 minutes"` / `"By Link"` | that `id`, as a number, in `rotationId` — the one field with no code |
+| MIX package | `mix.quantities[]`: `tag`, `name`, `quantities[]` | `quantities[].tag` as `mixId` — the first argument of `orderCalcMix()` |
+| resident tariff | `resident.tarifs[]`: `code`, `name`, `personal` | `code` (`"1-gb"`) as `tarifId` — exact match |
+| payment system | `balancePaymentsList()`: `id`, `name` | `id` — the one unavoidable id, see [Paying for orders](#paying-for-orders) |
+
+ObjectIds are still accepted everywhere if you happen to have them; the reference simply no longer
+publishes them.
 
 ## Error handling
 
@@ -148,7 +174,7 @@ ordinary call is positional. The object form exists for payloads that do not fit
 positional signature.
 
 ```js
-api.setPaymentId('PAYMENT_SYSTEM_OBJECT_ID'); // or setPaymentCode('balance')
+api.setPaymentId('PAYMENT_SYSTEM_OBJECT_ID'); // see “Paying for orders” above
 
 // countryId='USA' (alpha3), periodId='1m', customTargetName is required for ipv4:
 await api.orderCalcIpv4('USA', '1m', 2, null, null, 'scraping');
@@ -162,10 +188,8 @@ await api.orderCalcIpv4('USA', '1m', 2, null, null, 'scraping', { uptime: true }
 await api.orderMakeMobile('USA', '1m', 1, null, null, 'OPERATOR_ID', 10);
 await api.orderMakeMobile('USA', '1m', 1, null, null, 'OPERATOR_ID', 0, 'shared');
 
-// MIX takes a package identifier, not a countryId. Both the package id and its tag work:
-await api.orderCalcMix('MIX_ID', '1m', 1);
-await api.orderCalcMix('mix-us-eu', '1m', 1);
-await api.orderCalcMixByCode('mix-us-eu', '1m', 1); // explicit mixCode/periodCode
+// MIX takes a package code (reference/list/mix -> quantities[].tag), not a countryId:
+await api.orderCalcMix('europe-2-mix_IPv4', '1m', 1);
 
 // Resident: tarifId accepts the tariff ObjectId or its code.
 await api.orderCalcResident('TARIF_ID');
@@ -178,23 +202,46 @@ arguments — not placeholders for codes.
 `dedicated`. `uptime` is available for supported IPv4/ISP combinations.
 `setGenerateAuth('Y')` affects only `order/make`.
 
-`customTargetName` is required for `ipv4`, `ipv6` and `isp` (the server answers
-`Incorrect goal`, code 14). For `mix` / `mix_isp` it is required only when the MIX package
-cannot be resolved: passing `mixId`, `mixCode`, `countryId: "packageId:quantity"`, or
-`countryId` together with `quantity > 0` is enough. The SDK checks this locally, mirroring
-`ClientApiService.parseMixSelection`.
+`customTargetName` — what you use the proxies for. Required for `ipv4`, `ipv6` and `isp`;
+without it the server answers `Incorrect goal`, code 14. For `mix` / `mix_isp` it is only needed
+when the server cannot tell which package you mean, so naming the package removes the need for it.
 
-## Prolongation
+## Renewing proxies
 
-`prolong/*` runs the same code fallback as `order/*`, so `periodId` takes a code positionally:
+Renew by the addresses themselves — the same strings `proxyList()` gives you. No ids to look up:
 
 ```js
-await api.prolongMake('ipv4', ['ORDER_ID'], '1m', 'SALE10');
+const { items } = await api.proxyList('ipv4');
+const ips = items.map(item => item.ip);          // ['1.2.3.4', '5.6.7.8']
+
+await api.prolongCalc('ipv4', ips, '1m');        // price first
+await api.prolongMake('ipv4', ips, '1m');        // deducts money
 ```
 
-The object form exists for the fields with no positional slot — `orderSeparatorId` /
-`orderSeparatorIds` — and exposes the complete v2 payload: `ids`, `orderSeparatorId`,
-`orderSeparatorIds`, `periodId`/`periodCode`, `paymentId`/`paymentCode`, `coupon`.
+`prolongCalc()` shows the price; `prolongMake()` charges the balance. If the balance is short,
+`prolongMake()` throws an `ApiError` with the server's warning — it never reports a renewal that
+did not happen.
+
+The address format follows the proxy type, exactly as `proxyList()` returns it:
+
+| type | address |
+|---|---|
+| `ipv4`, `isp`, `mix` | `1.2.3.4` |
+| `ipv6` | `host:port` |
+| `mobile` | `ip:portHttp:portSocks` |
+
+ObjectId strings work too, and a mixed array works — each value is routed by its shape. The period
+takes a code positionally (`'1m'`), same fallback as `order/*`, and the fourth argument is a coupon:
+
+```js
+await api.prolongMake('ipv4', ips, '1m', 'SALE10');
+```
+
+<details>
+<summary>Renewing part of a MIX order</summary>
+
+A MIX order can be split into parts that renew independently. Those parts are addressed by id,
+and the object form of the call is how you pass them:
 
 ```js
 await api.prolongMake('mix', {
@@ -202,6 +249,11 @@ await api.prolongMake('mix', {
   periodId: '1m', coupon: 'SALE10'
 });
 ```
+
+The object form also exposes the complete v2 payload: `ips`, `ids`, `orderSeparatorId`,
+`orderSeparatorIds`, `periodId`/`periodCode`, `paymentId`/`paymentCode`, `coupon`.
+
+</details>
 
 ## Balance
 

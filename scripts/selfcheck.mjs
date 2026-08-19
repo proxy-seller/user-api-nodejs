@@ -153,18 +153,18 @@ await check('README: rotationId=0 (By Link) не отбрасывается ка
     assertEqual(payload.mobileServiceType, 'shared', 'mobileServiceType lost');
 });
 
-await check('README: mix принимает и id пакета, и его tag', () => {
-    for (const identifier of ['MIX_ID', 'mix-us-eu']) {
+await check('README: mix принимает код пакета и его ObjectId', () => {
+    for (const identifier of ['europe-2-mix_IPv4', '68b1f0c4e13a4c0f1a2b3c4d']) {
         const payload = api.prepareMix(identifier, '1m', 1);
         api.assertTargetName(payload);
         assertEqual(payload.mixId, identifier, 'mixId lost');
     }
 });
 
-await check('README: prolong позиционно с кодом периода', () => {
+await check('README: prolong по адресам с кодом периода и купоном', () => {
     assertEqual(
-        api.prepareProlong(['ORDER_ID'], '1m', 'SALE10'),
-        { ids: ['ORDER_ID'], periodId: '1m', coupon: 'SALE10' }
+        api.prepareProlong(['1.2.3.4', '5.6.7.8'], '1m', 'SALE10'),
+        { ips: ['1.2.3.4', '5.6.7.8'], periodId: '1m', coupon: 'SALE10' }
     );
 });
 
@@ -339,6 +339,44 @@ await check('constructor: apiKey кодируется в baseURL', () => {
 
 await check('constructor: без key — ApiError', () =>
     expectApiError(() => new ProxySellerUserApi({}), 'Need key'));
+
+/////////////////////////////// prolong по адресам ///////////////////////////////
+
+const prolongClient = new ProxySellerUserApi({ key: 'k' });
+
+await check('prolong: адреса уезжают в ips, пустого ids рядом нет', () => {
+    const payload = prolongClient.prepareProlong(['1.2.3.4', '5.6.7.8'], '1m', '');
+    assertEqual(payload.ips, ['1.2.3.4', '5.6.7.8'], 'ips lost');
+    assert(!('ids' in payload), `ids must be absent, got ${JSON.stringify(payload)}`);
+});
+
+await check('prolong: ObjectId уезжает в ids', () => {
+    const payload = prolongClient.prepareProlong(['68b1f0c4e13a4c0f1a2b3c4d'], '1m', '');
+    assertEqual(payload.ids, ['68b1f0c4e13a4c0f1a2b3c4d'], 'ids lost');
+    assert(!('ips' in payload), `ips must be absent, got ${JSON.stringify(payload)}`);
+});
+
+await check('prolong: смешанный список разводится по форме', () => {
+    const payload = prolongClient.prepareProlong(['1.2.3.4', '68b1f0c4e13a4c0f1a2b3c4d'], '1m', '');
+    assertEqual(payload.ips, ['1.2.3.4'], 'ips lost');
+    assertEqual(payload.ids, ['68b1f0c4e13a4c0f1a2b3c4d'], 'ids lost');
+});
+
+await check('prolong: ipv6 "host:port" и mobile-тройка — тоже адреса', () => {
+    const payload = prolongClient.prepareProlong(['2001:db8::1:8080', '10.0.0.1:8000:9000'], '1m', '');
+    assertEqual(payload.ips, ['2001:db8::1:8080', '10.0.0.1:8000:9000'], 'ips lost');
+});
+
+await check('prolong: строка через запятую и пустые элементы', () => {
+    const payload = prolongClient.prepareProlong('1.2.3.4, 5.6.7.8 ,  ', '1m', '');
+    assertEqual(payload.ips, ['1.2.3.4', '5.6.7.8'], 'ips lost');
+});
+
+await check('order/calc mix: код пакета уезжает в mixId', () => {
+    const payload = prolongClient.prepareMix('europe-2-mix_IPv4', '1m', 10, null, null, null);
+    assertEqual(payload.mixId, 'europe-2-mix_IPv4', 'mixId lost');
+    assert(!('countryId' in payload), `countryId must not be sent, got ${JSON.stringify(payload)}`);
+});
 
 /////////////////////////////// итог ///////////////////////////////
 
