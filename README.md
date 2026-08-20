@@ -91,7 +91,7 @@ await api.orderCalcIpv4('USA', '1m', 2, null, null, 'scraping');
 await api.orderCalcMobile('USA', '1m', 1, null, null, 'OPERATOR_ID', 5);
 ```
 
-Case handling of the fallback: `countryId` is upper-cased (so it matches `alpha3`), `periodId`
+Case handling of the fallback: `countryId` is upper-cased (so it matches the alpha-3 code), `periodId`
 is lower-cased, `operatorId` is matched against the operator tag as given, `mixId` must match a
 MIX `tag` exactly, `tarifId` must match a tariff `code` exactly. `paymentId` is matched against
 the payment-system code and against `PaymentSystemTypes` names.
@@ -113,17 +113,17 @@ always rejected with `Set existed [rotationCode] from reference`. Pass the numbe
 
 ### What `referenceList()` actually returns
 
-Every field comes back as a readable code. Read it, pass it straight into the request — there is
-no id to look up:
+Every field comes back as `id`, and its value is a readable code — not an ObjectId. Read `id`,
+put it in the matching `*Id` argument. That is the whole rule:
 
 | you need | `referenceList()` gives | pass |
 |---|---|---|
-| country | `country[]`: `alpha3`, `name` | `alpha3` (`"USA"`) as `countryId` — upper-cased server-side |
-| period | `period[]`: `code`, `name` | `code` (`"1m"`) as `periodId` — lower-cased server-side |
-| mobile operator | `mobile.country[].operators.{dedicated,shared}[]`: `tag`, `name`, `rotations[]` | `tag` as `operatorId` — exact match, case-sensitive |
-| rotation | `operators[].rotations[]`: `id` = minutes, `name` = `"5 minutes"` / `"By Link"` | that `id`, as a number, in `rotationId` — the one field with no code |
-| MIX package | `mix.quantities[]`: `tag`, `name`, `quantities[]` | `quantities[].tag` as `mixId` — the first argument of `orderCalcMix()` |
-| resident tariff | `resident.tarifs[]`: `code`, `name`, `personal` | `code` (`"1-gb"`) as `tarifId` — exact match |
+| country | `country[]`: `id`, `name` | `id` (`"USA"`) as `countryId` — upper-cased server-side |
+| period | `period[]`: `id`, `name` | `id` (`"1m"`) as `periodId` — lower-cased server-side |
+| mobile operator | `mobile.country[].operators.{dedicated,shared}[]`: `id`, `name`, `rotations[]` | `id` as `operatorId` — exact match, case-sensitive |
+| rotation | `operators[].rotations[]`: `id` = minutes, `name` = `"5 minutes"` / `"By Link"` | that `id`, as a number, in `rotationId` — the one `id` that is a number, not a code |
+| MIX package | `mix.quantities[]`: `id`, `name`, `quantities[]` | `quantities[].id` as `mixId` — the first argument of `orderCalcMix()` |
+| resident tariff | `resident.tarifs[]`: `id`, `name`, `personal` | `id` (`"1-gb"`) as `tarifId` — exact match |
 | payment system | `balancePaymentsList()`: `id`, `name` | `id` — the one unavoidable id, see [Paying for orders](#paying-for-orders) |
 
 ObjectIds are still accepted everywhere if you happen to have them; the reference simply no longer
@@ -176,7 +176,7 @@ positional signature.
 ```js
 api.setPaymentId('PAYMENT_SYSTEM_OBJECT_ID'); // see “Paying for orders” above
 
-// countryId='USA' (alpha3), periodId='1m', customTargetName is required for ipv4:
+// countryId='USA' and periodId='1m' are country[].id / period[].id from the reference:
 await api.orderCalcIpv4('USA', '1m', 2, null, null, 'scraping');
 
 // uptime has no positional slot — this is what the options object is for:
@@ -188,7 +188,7 @@ await api.orderCalcIpv4('USA', '1m', 2, null, null, 'scraping', { uptime: true }
 await api.orderMakeMobile('USA', '1m', 1, null, null, 'OPERATOR_ID', 10);
 await api.orderMakeMobile('USA', '1m', 1, null, null, 'OPERATOR_ID', 0, 'shared');
 
-// MIX takes a package code (reference/list/mix -> quantities[].tag), not a countryId:
+// MIX takes a package code (reference/list/mix -> quantities[].id), not a countryId:
 await api.orderCalcMix('europe-2-mix_IPv4', '1m', 1);
 
 // Resident: tarifId accepts the tariff ObjectId or its code.

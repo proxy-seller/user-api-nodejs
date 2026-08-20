@@ -529,18 +529,20 @@ class ProxySellerUserApi {
     /**
      * Necessary guides for creating an order.
      *
-     * Что реально приходит (и чего НЕ приходит — на это нельзя рассчитывать):
-     *   country[]           id, name, alpha3            -> alpha3 = код страны, есть
-     *   period[]            id, name                    -> кода периода НЕТ
-     *   mobile country[]    id, name, operators{...}     -> у оператора только id и name, отдельного
-     *                                                      поля с тегом нет (в fallback-ветке
-     *                                                      бэкенда в id лежит сам тег; operatorId
-     *                                                      принимает и то, и другое)
-     *   operators[].rotations[]  id = МИНУТЫ, name       -> "5 minutes", 0 = "By Link"
-     *   mix country[]       id, name, alpha3=null, tag   -> tag = mixCode, есть
-     *   mix quantities[]    id, name, quantities[]       -> тега здесь НЕТ
-     *   resident tarifs[]   id, name, personal           -> кода тарифа НЕТ
-     * Платёжные системы лежат отдельно, в balancePaymentsList(): id, name, кода тоже НЕТ.
+     * Всюду идентификатор называется id, а внутри лежит читаемый код, не ObjectId.
+     * Значение id кладётся в одноимённый *Id заказа — выбирать не из чего:
+     *   country[]                id, name                -> id = alpha3 страны ("USA")
+     *   period[]                 id, name                -> id = код периода ("1m")
+     *   mobile country[]         id, name, operators{dedicated[], shared[]}
+     *   operators[]              id, name, rotations[]   -> id = тег оператора, регистр значим
+     *   operators[].rotations[]  id = МИНУТЫ, name       -> "5 minutes", 0 = "By Link";
+     *                                                       единственный id-число, а не код
+     *   mix quantities[]         id, name, quantities[]  -> id = код пакета, рядом же доступные
+     *                                                       количества — канон для mixId
+     *   mix country[]            id, name                -> тот же код пакета
+     *   resident tarifs[]        id, name, personal      -> id = код тарифа ("1-gb")
+     * Платёжные системы лежат отдельно, в balancePaymentsList(): там id — настоящий ObjectId,
+     * и это единственное исключение: на один код шлюза приходится несколько систем.
      *
      * @param string type - ipv4 | ipv6 | mobile | isp | mix | resident | null
      * @return object
