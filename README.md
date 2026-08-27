@@ -222,13 +222,17 @@ await api.prolongMake('ipv4', ips, '1m');        // deducts money
 `prolongMake()` throws an `ApiError` with the server's warning — it never reports a renewal that
 did not happen.
 
-The address format follows the proxy type, exactly as `proxyList()` returns it:
+What you pass follows the proxy type, and every field below is one `proxyList()` really returns:
 
-| type | address |
+| type | what you pass |
 |---|---|
-| `ipv4`, `isp`, `mix` | `1.2.3.4` |
-| `ipv6` | `host:port` |
-| `mobile` | `ip:portHttp:portSocks` |
+| `ipv4`, `isp`, `mix`, `mix_isp` | the address — the `ip` field, e.g. `1.2.3.4` |
+| `ipv6` | the address — the `ip` field, e.g. `1.2.3.4:26000` |
+| `mobile` | the address — `ip` + `:` + `port_http` + `:` + `port_socks` |
+
+For `ipv6` the `ip` field already carries the gateway together with the port
+(`1.2.3.4:26000`), while `ip_only` holds the bare gateway — so pass `ip` as-is, exactly like
+every other type.
 
 ObjectId strings work too, and a mixed array works — each value is routed by its shape. The period
 takes a code positionally (`'1m'`), same fallback as `order/*`, and the fourth argument is a coupon:

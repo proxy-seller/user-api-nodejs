@@ -952,9 +952,12 @@ class ProxySellerUserApi {
      * Клиенту удобнее продлевать по самим адресам — именно их он видит в proxy/list.
      * Сервер принимает их в поле ips и сам переводит в ids
      * (ClientApiService.resolveProlongIpsToIds — безусловно и для calc, и для make).
-     * Адрес содержит точку или двоеточие (ipv4 "ip", ipv6 "host:port",
-     * mobile "ip:portHttp:portSocks"), ObjectId — 24 hex-символа без них, так что
+     * Адрес содержит точку или двоеточие (ipv4/isp/mix "ip", ipv6 "ip" = "шлюз:порт",
+     * mobile "ip:port_http:port_socks"), ObjectId — 24 hex-символа без них, так что
      * смешанный список тоже работает.
+     *
+     * У ipv6 поле "ip" из proxy/list уже содержит шлюз с портом ("1.2.3.4:26000"),
+     * а "ip_only" — только шлюз, так что "ip" передаётся как есть, как и для остальных типов.
      * @param {array|string} ipsOrIds
      * @return {{ips: string[], ids: string[]}}
      */
@@ -1024,7 +1027,9 @@ class ProxySellerUserApi {
      * Calculate the renewal
      * @param string type - ipv4 | ipv6 | mobile | isp | mix
      * @param {array|string} ipsOrIds the addresses themselves, exactly as proxy/list returns them:
-     *   '1.2.3.4' for ipv4/isp/mix, 'host:port' for ipv6, 'ip:portHttp:portSocks' for mobile.
+     *   the 'ip' field ('1.2.3.4') for ipv4/isp/mix/mix_isp, the 'ip' field for ipv6 too
+     *   (it already carries the gateway with the port, '1.2.3.4:26000', while 'ip_only' holds
+     *   the bare gateway), and ip + ':' + port_http + ':' + port_socks for mobile.
      *   ObjectId strings are accepted too, and a mixed array works — each value is routed by shape.
      *   An object here is treated as the whole payload instead.
      * @param {string} periodId ObjectId or period code (e.g. '1m') — prolong runs the same fallback
@@ -1042,7 +1047,9 @@ class ProxySellerUserApi {
      * Create a renewal order. Attention! Deducts money from the balance.
      * @param string type - ipv4 | ipv6 | mobile | isp | mix
      * @param {array|string} ipsOrIds the addresses themselves, exactly as proxy/list returns them:
-     *   '1.2.3.4' for ipv4/isp/mix, 'host:port' for ipv6, 'ip:portHttp:portSocks' for mobile.
+     *   the 'ip' field ('1.2.3.4') for ipv4/isp/mix/mix_isp, the 'ip' field for ipv6 too
+     *   (it already carries the gateway with the port, '1.2.3.4:26000', while 'ip_only' holds
+     *   the bare gateway), and ip + ':' + port_http + ':' + port_socks for mobile.
      *   ObjectId strings are accepted too, and a mixed array works — each value is routed by shape.
      *   An object here is treated as the whole payload instead.
      * @param {string} periodId ObjectId or period code (e.g. '1m') — prolong runs the same fallback
