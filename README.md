@@ -58,6 +58,27 @@ its own URL, method, base URL and headers authoritative.
 
 </details>
 
+### Residential and scraper orders need a fingerprint
+
+`order/make` carries an `X-Fingerprint` header. Most sections ignore it, but **residential and
+scraper orders are not created without it at all** — the order service answers `Header
+X-Fingerprint is required` and nothing is ordered.
+
+```js
+const api = new ProxySellerUserApi({ key: 'YOUR_API_KEY', fingerprint: 'your-installation-id' });
+// or later:
+api.setFingerprint('your-installation-id');
+// or for a single call:
+await api.orderMakeResident('tarif-code', null, { fingerprint: 'your-installation-id' });
+```
+
+Any opaque string is accepted — the server does not validate its shape — but it must be a
+**stable identifier of your installation**. The SDK deliberately does not generate one: a value
+randomized per process would break the anti-fraud and affiliate attribution the header exists for.
+
+Ordering resident or scraper without a fingerprint throws locally, rather than spending a round
+trip on a request the server is certain to reject.
+
 ## IDs in v2 are strings
 
 Every id in v2 is a MongoDB ObjectId **string** (`"665f1c…"`), not a number. Never parse an
@@ -128,6 +149,20 @@ put it in the matching `*Id` argument. That is the whole rule:
 
 ObjectIds are still accepted everywhere if you happen to have them; the reference simply no longer
 publishes them.
+
+**The typed call is shaped differently.** `referenceList()` without a type returns `data` keyed by
+type (`data.mix.quantities`, `data.resident.tarifs`, …), exactly as the table above shows. Passing
+a type wraps the single entry in `items` instead:
+
+```js
+const all = await api.referenceList();          // all.mix.quantities
+const mix = await api.referenceList('mix');     // mix.items.quantities  ← note the wrapper
+```
+
+`items` here is an **object**, not an array — for `resident` and `scraper` it is `{ tarifs: [...] }`,
+for `mix` and `mix_isp` it is `{ country, period, quantities }`, and `{ country, period }` for the
+rest. (The published OpenAPI examples show `data.items` as an array; that is a documentation bug on
+the server side — the array form is an internal DTO, not this response.)
 
 ## Error handling
 
@@ -259,6 +294,44 @@ The object form also exposes the complete v2 payload: `ips`, `ids`, `orderSepara
 
 </details>
 
+## Automatic renewal
+
+`prolongMake()` charges you now. `autoprolong/*` only arms a charge that happens later, without
+you present — a separate branch of the API, not a flag on prolong.
+
+```js
+await api.autoProlongCalc('ipv4', ['1.2.3.4'], '1m', { paymentId: 'balance' });
+await api.autoProlongEnable('ipv4', ['1.2.3.4'], '1m', { paymentId: 'balance' });
+await api.autoProlongDisable('ipv4', ['1.2.3.4']);
+```
+
+`paymentId` is **mandatory** for `calc` and `enable` — the charge happens while you are away, so
+the payment system cannot be guessed. Only `balance` and `paddle_subscription` are accepted: a
+one-off Paddle checkout needs a browser redirect a headless client cannot complete. With
+`paddle_subscription` also pass `subscriptionId`.
+
+Residential packages renew as a package, not as addresses — send no selection:
+
+```js
+await api.autoProlongCalc('resident', null, null, { paymentId: 'balance' });
+await api.autoProlongEnable('resident', null, null, { paymentId: 'balance', tarifId: 'trial' });
+await api.autoProlongDisable('resident');
+```
+
+Three things about the answers before you parse them:
+
+* **`ids` is not an echo.** For `ipv6` the whole order is switched at once, so `quantity` and
+  `ids` can cover more proxies than you sent.
+* **Not enough money is not an error throw.** `calc` answers `status: "error"` with a *filled*
+  `data` and an empty `errors[]` — the same shape `prolong/calc` uses. Read `data.warning`.
+* **Residential fills different fields.** `days` and `chargeDate` are null there (a package renews
+  on expiry *or* on traffic exhaustion, so no single date describes it); `tarifId` and `dateEnd`
+  carry the meaning instead.
+
+`scraper` has no auto-renewal: it is extended by buying traffic through `order/make`.
+
+> Replaces `resident/autorenew/{enable,disable,calculate}`, **removed** from the server.
+
 ## Balance
 
 ```js
@@ -282,7 +355,7 @@ and rejected by the endpoint.
 const state = await api.balanceAutoTopupGet();
 // { configured, enabled, state, threshold, amount, subscriptionId,
 //   paymentMethod: { id, status, paymentMethod, brand, last4, exp } | null,
-//   dailyCountCap, monthlyAmountCap, failCount, lastAttemptAt,
+//   failCount, lastAttemptAt,
 //   lastEvent: { status, amount, at, reason } | null }
 
 // Turn it on:
@@ -294,22 +367,23 @@ await api.balanceAutoTopupSet({ threshold: 20 });
 
 `state` is one of `NO_PAYMENT_METHOD`, `DISABLED`, `ACTIVE`, `PAYMENT_INVALID`,
 `PAUSED_FAILURES`. `lastEvent.status` is one of `TRIGGERED`, `SUCCEEDED`, `FAILED`,
-`SKIPPED_CAP`, `SETTINGS_SAVED`, `PAUSED`. `dailyCountCap` / `monthlyAmountCap` in the
-response are the **effective** limits — either the values you set or the server defaults
-(5 charges per day, 500 per 30 days).
+`SKIPPED_CAP`, `SETTINGS_SAVED`, `PAUSED`.
+
+> **`dailyCountCap` and `monthlyAmountCap` are gone.** They were removed from the contract on
+> 2026-08-18: the server silently ignores them, and they are absent from the response. The SDK
+> now rejects them instead of letting the call look successful while changing nothing.
 
 `balance/autotopup/set` is a **partial update**: any field you omit keeps its stored value,
 and the server validates the *merged* result. The SDK sends only the fields you actually
 passed — `undefined` and `null` are dropped rather than sent as `null` — and rejects a call
 with no recognised field at all. Accepted fields: `enabled`, `threshold`, `amount`,
-`subscriptionId`, `dailyCountCap`, `monthlyAmountCap`. On success the response is the state
+`subscriptionId`. On success the response is the state
 **after** saving, so no follow-up `balanceAutoTopupGet()` is needed.
 
 Pause and the failed-charge counter are reset only on an explicit `enabled: true` — editing a
 threshold on a paused configuration does not silently resume it.
 
-Validation boundaries: `threshold >= 1`, `amount >= 5` and `amount >= threshold`,
-`dailyCountCap >= 1`, `monthlyAmountCap >= amount`. Error codes:
+Validation boundaries: `threshold >= 1`, `amount >= 5` and `amount >= threshold`. Error codes:
 
 | code | meaning |
 |---|---|
@@ -318,9 +392,10 @@ Validation boundaries: `threshold >= 1`, `amount >= 5` and `amount >= threshold`
 | 51 | amount below the minimum (`customData.minAmount`) |
 | 52 | amount below the threshold — it would trigger again immediately |
 | 53 | no saved payment method |
-| 54 | daily count cap below the minimum (`customData.minDailyCountCap`) |
-| 55 | monthly amount cap below a single top-up amount |
 | 56 | the saved card has expired |
+
+Codes 54 and 55 were removed together with the caps and are not reused. `customData` now
+carries only `minAmount` and `minThreshold`.
 
 ## Proxies
 
@@ -425,6 +500,23 @@ const geo = JSON.parse(Buffer.from(await api.residentGeo()).toString('utf8'));
   successful one.
 - `balanceAdd()` uses its explicit `paymentId`, then falls back to `setPaymentId()`;
   `paymentCode` is not resolved here.
+
+## Keeping up with the server
+
+Changes made after the 2.0 release, in the order the server shipped them:
+
+- **`resident/autorenew/{enable,disable,calculate}` were removed** and replaced by
+  `autoprolong/{calc,enable,disable}/{type}` — see [Automatic renewal](#automatic-renewal).
+  `type: 'resident'` is the residential branch of the same three endpoints.
+- **`order/make` requires `X-Fingerprint`** for residential and scraper orders. The SDK can now
+  send it; without a value those two sections fail locally instead of being rejected by the server.
+- **`dailyCountCap` / `monthlyAmountCap` were removed** from `balance/autotopup/set` (2026-08-18).
+  The server ignores them, so the SDK now rejects them rather than letting the call look
+  successful while changing nothing. Error codes 54 and 55 are gone with them.
+- **`*Code` no longer overrides a paired `*Id`** for `mixId`, `operatorId`, `rotationId` and
+  `tarifId`. The server gives the *id* priority on those four, and the SDK was inverting it —
+  a caller who filled both halves silently got the wrong package, operator, rotation or tariff.
+  An empty-string `*Code` no longer wipes a valid `*Id` either.
 
 ## Development
 

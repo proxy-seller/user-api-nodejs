@@ -32,18 +32,80 @@ export const PROXY_REPLACE_TYPES = Object.freeze([
 
 /** Поля тела balance/autotopup/set. Всё опционально — это partial update. */
 const AUTO_TOPUP_SET_FIELDS = Object.freeze([
-    'enabled', 'threshold', 'amount', 'subscriptionId', 'dailyCountCap', 'monthlyAmountCap'
+    'enabled', 'threshold', 'amount', 'subscriptionId'
 ]);
+
+/**
+ * Убраны из контракта 18.08.2026 (AutoTopupSetRequestClientDto): сервер их больше не читает,
+ * коды ошибок 54/55 удалены и не переиспользуются, ключа minDailyCountCap в customData нет.
+ * Раньше SDK их отправлял — вызов проходил локальный гейт, отвечал success и не делал НИЧЕГО.
+ * Отбиваем локально, чтобы тихий no-op стал видимым.
+ */
+const AUTO_TOPUP_REMOVED_FIELDS = Object.freeze(['dailyCountCap', 'monthlyAmountCap']);
+
+/**
+ * Пары *Id / *Code с указанием СТАРШЕЙ половины — дословно так их разбирает сервер
+ * (ClientApiService.normalizeOrderReferenceCodes). payment/country/period резолвятся от кода
+ * (`if (code)`), а operator/rotation/mix/tarif — от идентификатора
+ * (`if (code && !trimToNull(id))`): там код применяется, только когда парный id пуст.
+ *
+ * Раньше SDK удалял *Id ВСЯКИЙ РАЗ, когда задан *Code, и для нижних четырёх пар это
+ * инвертировало контракт: клиент, заполнивший обе половины, молча получал не тот
+ * пакет/оператора/ротацию/тариф, который выбрал бы сервер.
+ */
+const ORDER_REFERENCE_PAIRS = Object.freeze([
+    ['paymentId', 'paymentCode', 'code'],
+    ['countryId', 'countryCode', 'code'],
+    ['periodId', 'periodCode', 'code'],
+    ['operatorId', 'operatorCode', 'id'],
+    ['rotationId', 'rotationCode', 'id'],
+    ['mixId', 'mixCode', 'id'],
+    ['tarifId', 'tarifCode', 'id']
+]);
+
+/**
+ * Пары *Id / *Code тела prolong/* и autoprolong/*: normalizeProlongReferenceCodes знает только
+ * эти две, и обе резолвятся от кода.
+ */
+const PROLONG_REFERENCE_PAIRS = Object.freeze([
+    ['periodId', 'periodCode', 'code'],
+    ['paymentId', 'paymentCode', 'code']
+]);
+
+/** Имя заголовка фингерпринта — единственное место, где оно записано. */
+const FINGERPRINT_HEADER = 'X-Fingerprint';
+
+/**
+ * Секции order/make, которые без фингерпринта не создаются ВООБЩЕ: OrderService
+ * .createResidentOrder / .createScraperOrder отвечают 400 "Header X-Fingerprint is required"
+ * ещё до расчёта цены. Остальные секции заголовок игнорируют, слать его им безопасно.
+ */
+const FINGERPRINT_REQUIRED_SECTIONS = Object.freeze(['resident', 'scraper']);
+
+/**
+ * Snake-алиасы тела autoprolong/*, которые сервер принимает наравне с camelCase
+ * (AutoProlongRequestClientDto.applyAliases). Приводим их к каноническому написанию:
+ * camelCase на сервере старше, и отправлять оба написания сразу незачем.
+ */
+const AUTO_PROLONG_ALIASES = Object.freeze({
+    payment_id: 'paymentId',
+    subscription_id: 'subscriptionId',
+    tarif_id: 'tarifId',
+    tariffId: 'tarifId'
+});
 
 class ProxySellerUserApi {
     URL = 'https://proxy-seller.com/personal/api/v2/';
     paymentId = null
     paymentCode = null
     generateAuth = 'N'
+    fingerprint = null
 
     /**
      * Key placed in https://proxy-seller.com/personal/api/ — уходит в ПУТЬ запроса,
      * не в заголовок.
+     *
+     * config.fingerprint — значение заголовка X-Fingerprint, см. setFingerprint().
      * @param {*} config
      * @throws ApiError
      */
@@ -60,12 +122,14 @@ class ProxySellerUserApi {
             baseURL,
             timeout = 30000,
             headers = {},
+            fingerprint = null,
             ...axiosConfig
         } = config;
         const apiRoot = String(baseUrl || baseURL || this.URL).replace(/\/+$/, '') + '/';
 
         this.baseURL = apiRoot + encodeURIComponent(key) + '/';
         this.timeout = timeout;
+        this.setFingerprint(fingerprint);
         this.client = axios.create({
             ...axiosConfig,
             baseURL: this.baseURL,
@@ -118,7 +182,36 @@ class ProxySellerUserApi {
     }
 
     /**
+     * X-Fingerprint — стабильный идентификатор УСТАНОВКИ клиента, уходит заголовком в order/make.
+     *
+     * Контракт объявляет заголовок обязательным на всей операции, но реально его требуют только
+     * резидентские и скраперные заказы: без него сервер отвечает
+     * "Header X-Fingerprint is required" и заказ не создаётся вовсе. Прочие секции заголовок
+     * игнорируют, поэтому SDK шлёт его всегда, когда значение задано.
+     *
+     * Форма значения не проверяется — подойдёт любая непрозрачная непустая строка. SDK её НЕ
+     * генерирует сам: заголовок введён ради анти-фрода и affiliate-атрибуции, а случайное
+     * значение на процесс ломает и то и другое. Сохраните его рядом с ключом.
+     *
+     * Пустая строка и пробелы считаются незаданным значением.
+     * @param string fingerprint
+     */
+    setFingerprint(fingerprint) {
+        this.fingerprint = fingerprint != null && String(fingerprint).trim() !== ''
+            ? String(fingerprint).trim()
+            : null;
+    }
+
+    getFingerprint() {
+        return this.fingerprint
+    }
+
+    /**
      * Send request into server
+     *
+     * options.headers кладутся ПОВЕРХ заголовков клиента (axios мержит их с дефолтами
+     * инстанса), не заменяя их: так order/make добавляет X-Fingerprint, не трогая
+     * Content-Type и то, что передали в конструктор.
      * @param string method
      * @param string uri
      * @param {*} options
@@ -269,13 +362,17 @@ class ProxySellerUserApi {
      * (0 = By Link, 5, 10, 60...). rotationCode is only copied into rotationId after an
      * isInteger() check, so '5m' / '10m' are always rejected with
      * "Set existed [rotationCode] from reference".
+     *
+     * Когда заполнены обе половины пары, лишняя убирается по ПРИОРИТЕТУ СЕРВЕРА
+     * (ORDER_REFERENCE_PAIRS): payment/country/period резолвятся от кода, а
+     * operator/rotation/mix/tarif — от идентификатора.
      */
     mergeOrderOptions(payload, options = {}) {
         const allowed = [
             'countryId', 'countryCode', 'periodId', 'periodCode', 'paymentId', 'paymentCode',
             'mixId', 'mixCode', 'uptime', 'protocol', 'mobileServiceType', 'operatorId',
             'operatorCode', 'rotationId', 'rotationCode', 'tarifId', 'tarifCode',
-            'authorization', 'coupon', 'customTargetName', 'quantity'
+            'authorization', 'coupon', 'customTargetName', 'quantity', 'fingerprint'
         ];
         const values = options && typeof options === 'object' && !Array.isArray(options)
             ? options
@@ -286,19 +383,35 @@ class ProxySellerUserApi {
             }
         }
 
-        for (const [idKey, codeKey] of [
-            ['countryId', 'countryCode'], ['periodId', 'periodCode'],
-            ['paymentId', 'paymentCode'], ['mixId', 'mixCode'],
-            ['operatorId', 'operatorCode'], ['rotationId', 'rotationCode'],
-            ['tarifId', 'tarifCode']
-        ]) {
-            if (Object.prototype.hasOwnProperty.call(values, codeKey) && values[codeKey] != null) {
-                delete payload[idKey];
-            } else if (Object.prototype.hasOwnProperty.call(values, idKey) && values[idKey] != null) {
-                delete payload[codeKey];
+        return this.filterEmpty(this._resolveReferencePairs(payload, ORDER_REFERENCE_PAIRS));
+    }
+
+    /**
+     * Оставляет в теле ту половину пары *Id / *Code, которую выбрал бы сервер, и выбрасывает
+     * вторую. Правило приоритета лежит в самой паре — см. ORDER_REFERENCE_PAIRS.
+     *
+     * Пустое значение ('' и пробелы) считается НЕзаданным. Раньше проверка была на `!= null`,
+     * из-за чего `*Code: ''` стирал валидный парный `*Id`, и заказ уезжал без ссылки на
+     * справочник — сервер сам трактует пустую строку как отсутствие (trimToNull).
+     * @param {object} payload
+     * @param {array} pairs
+     * @return {object}
+     */
+    _resolveReferencePairs(payload, pairs) {
+        const filled = (v) => v != null && String(v).trim() !== '';
+        for (const [idKey, codeKey, senior] of pairs) {
+            const primary = senior === 'code' ? codeKey : idKey;
+            const secondary = senior === 'code' ? idKey : codeKey;
+            if (filled(payload[primary])) {
+                delete payload[secondary];
+            } else {
+                delete payload[primary];
+                if (!filled(payload[secondary])) {
+                    delete payload[secondary];
+                }
             }
         }
-        return this.filterEmpty(payload);
+        return payload;
     }
 
     /**
@@ -441,14 +554,13 @@ class ProxySellerUserApi {
      *
      * data (AutoTopupStateClientDto): configured, enabled, state, threshold, amount,
      * subscriptionId, paymentMethod {id, status, paymentMethod, brand, last4, exp},
-     * dailyCountCap, monthlyAmountCap, failCount, lastAttemptAt,
-     * lastEvent {status, amount, at, reason}.
+     * failCount, lastAttemptAt, lastEvent {status, amount, at, reason}.
      *
      * `state` — одно из NO_PAYMENT_METHOD | DISABLED | ACTIVE | PAYMENT_INVALID | PAUSED_FAILURES.
      * `lastEvent.status` — TRIGGERED | SUCCEEDED | FAILED | SKIPPED_CAP | SETTINGS_SAVED | PAUSED.
      * paymentMethod = null, если платёжный метод не привязан; lastEvent = null, если срабатываний
-     * ещё не было. dailyCountCap/monthlyAmountCap — ДЕЙСТВУЮЩИЕ значения: либо заданные
-     * пользователем, либо серверные дефолты (5 списаний в сутки, 500 за 30 дней).
+     * ещё не было. Лимитов dailyCountCap/monthlyAmountCap в ответе БОЛЬШЕ НЕТ — они убраны из
+     * контракта 18.08.2026.
      *
      * Если фича выключена на окружении (Property enabled_autopopup_balance), приходит
      * ошибка code=49 "Auto top-up is not available".
@@ -467,25 +579,26 @@ class ProxySellerUserApi {
      * достаточно `{ threshold: 20 }`.
      *
      * Поля: enabled (boolean), threshold (number), amount (number),
-     * subscriptionId (string, Paddle-подписка из paymentMethod.id), dailyCountCap (int),
-     * monthlyAmountCap (number).
+     * subscriptionId (string, Paddle-подписка из paymentMethod.id).
      *
-     * Границы: threshold >= 1, amount >= 5 и amount >= threshold, dailyCountCap >= 1,
-     * monthlyAmountCap >= amount. Коды ошибок валидации — 50 (min threshold), 51 (min amount),
-     * 52 (amount < threshold), 53 (нет привязанного платёжного метода), 54 (min dailyCountCap),
-     * 55 (monthlyAmountCap < amount), 56 (карта истекла), 49 (фича выключена на окружении).
-     * Для 50/51/54 сервер кладёт допустимую границу в errors[0].customData —
-     * {minThreshold} / {minAmount} / {minDailyCountCap}, доступно как error.customData.
+     * dailyCountCap и monthlyAmountCap УБРАНЫ из контракта 18.08.2026: сервер их игнорирует,
+     * а коды 54/55 удалены и не переиспользуются. Переданные — локальная ApiError, иначе вызов
+     * тихо не делал бы ничего.
+     *
+     * Границы: threshold >= 1, amount >= 5 и amount >= threshold. Коды ошибок валидации —
+     * 50 (min threshold), 51 (min amount), 52 (amount < threshold), 53 (нет привязанного
+     * платёжного метода), 56 (карта истекла), 49 (фича выключена на окружении).
+     * Для 50/51 сервер кладёт допустимую границу в errors[0].customData —
+     * {minThreshold} / {minAmount}, доступно как error.customData.
      *
      * Сброс паузы и счётчика неудач происходит только при ЯВНОМ enabled: true.
      *
      * На успехе возвращается состояние ПОСЛЕ сохранения — та же форма, что у
      * balanceAutoTopupGet(), второй запрос не нужен.
      *
-     * @param {{enabled?: boolean, threshold?: number, amount?: number, subscriptionId?: string,
-     *          dailyCountCap?: number, monthlyAmountCap?: number}} settings
+     * @param {{enabled?: boolean, threshold?: number, amount?: number, subscriptionId?: string}} settings
      * @return {Promise<object>}
-     * @throws ApiError если не передано ни одного известного поля
+     * @throws ApiError если не передано ни одного известного поля либо передано удалённое
      */
     async balanceAutoTopupSet(settings = {}) {
         return this.request('post', 'balance/autotopup/set', {
@@ -505,6 +618,17 @@ class ProxySellerUserApi {
         const values = settings && typeof settings === 'object' && !Array.isArray(settings)
             ? settings
             : {};
+        const removed = AUTO_TOPUP_REMOVED_FIELDS.filter(
+            (key) => Object.prototype.hasOwnProperty.call(values, key)
+        );
+        if (removed.length > 0) {
+            throw new ApiError(
+                `balance/autotopup/set no longer accepts ${removed.join(', ')}: the caps were ` +
+                'removed from the contract on 2026-08-18 and the server ignores them, so sending ' +
+                'them would look like success while nothing changed. Drop the field(s) — error ' +
+                'codes 54/55 are gone with them.'
+            );
+        }
         const body = {};
         for (const key of AUTO_TOPUP_SET_FIELDS) {
             if (!Object.prototype.hasOwnProperty.call(values, key)) {
@@ -528,6 +652,11 @@ class ProxySellerUserApi {
 
     /**
      * Necessary guides for creating an order.
+     *
+     * ФОРМА ОТВЕТА РАЗНАЯ. referenceList('ipv4') отдаёт `{items: {country: [...], period: [...]}}`
+     * — обёртка items здесь ОБЪЕКТ, а не массив, — а referenceList() без типа отдаёт справочники
+     * сразу по ключам типов: `{ipv4: {...}, ipv6: {...}, mix: {...}, resident: {...}}`, без items.
+     * Читать типизированный ответ как нетипизированный нельзя.
      *
      * Всюду идентификатор называется id, а внутри лежит читаемый код, не ObjectId.
      * Значение id кладётся в одноимённый *Id заказа — выбирать не из чего:
@@ -738,19 +867,80 @@ class ProxySellerUserApi {
         return { status: data };
     }
 
+    /**
+     * Достаёт значение X-Fingerprint для конкретного вызова и убирает его из ТЕЛА: это
+     * заголовок, поля `fingerprint` сервер не знает. Принимать его в теле всё же надо —
+     * типизированные хелперы общие для calc и make, и других путей у options нет.
+     *
+     * Приоритет: явный аргумент вызова -> ключ fingerprint в теле/options -> значение клиента
+     * (конструктор либо setFingerprint). Пустая строка и пробелы — незаданное значение.
+     * @param {*} json
+     * @param {*} override
+     * @return {{body: *, fingerprint: (string|null)}}
+     */
+    _takeFingerprint(json, override = null) {
+        const isPayload = json && typeof json === 'object' && !Array.isArray(json);
+        const body = isPayload ? { ...json } : json;
+        const inline = isPayload ? json.fingerprint : null;
+        if (isPayload) {
+            delete body.fingerprint;
+        }
+        const filled = (v) => v != null && String(v).trim() !== '';
+        const value = [override, inline, this.getFingerprint()].find(filled);
+        return { body: body, fingerprint: filled(value) ? String(value).trim() : null };
+    }
+
+    /**
+     * Резидентский и скраперный заказы без X-Fingerprint не создаются вовсе: сервер отвечает
+     * "Header X-Fingerprint is required" ещё до расчёта цены. Падаем локально — как на
+     * "Set [paymentId]", — вместо заведомо отбиваемого запроса. Прочие секции заголовок
+     * игнорируют, для них отсутствие значения не ошибка.
+     * @param {object} json
+     * @param {*} fingerprint
+     * @throws ApiError
+     */
+    _assertFingerprint(json, fingerprint) {
+        if (fingerprint != null) {
+            return;
+        }
+        const section = json ? String(json.sectionCode) : '';
+        if (!FINGERPRINT_REQUIRED_SECTIONS.includes(section)) {
+            return;
+        }
+        throw new ApiError(
+            `order/make for ${section} requires the ${FINGERPRINT_HEADER} header ` +
+            '("Header X-Fingerprint is required"): pass a stable identifier of your installation ' +
+            'as new ProxySellerUserApi({ key, fingerprint }), via setFingerprint(value) or as the ' +
+            'second argument of orderMake(). The SDK never invents one — a value that changes ' +
+            'between runs breaks the anti-fraud and affiliate attribution the header exists for.'
+        );
+    }
+
     async orderCalc(json) {
-        this.assertTargetName(json);
-        return this.request('post', 'order/calc', { data: json });
+        // order/calc заголовка не объявляет — fingerprint только вынимаем из тела, чтобы он
+        // не уехал в payload неизвестным сервером полем.
+        const { body } = this._takeFingerprint(json);
+        this.assertTargetName(body);
+        return this.request('post', 'order/calc', { data: body });
     }
 
     /**
      * Create an order
      * @param {*} json Free format object to send into endpoint
+     * @param {string} fingerprint X-Fingerprint только для этого вызова; по умолчанию берётся
+     *        значение клиента (конструктор / setFingerprint), а также ключ fingerprint из json
      * @return object
      */
-    async orderMake(json) {
-        this.assertTargetName(json);
-        return this.request('post', 'order/make', { data: json });
+    async orderMake(json, fingerprint = null) {
+        const taken = this._takeFingerprint(json, fingerprint);
+        this.assertTargetName(taken.body);
+        this._assertFingerprint(taken.body, taken.fingerprint);
+        return this.request('post', 'order/make', {
+            data: taken.body,
+            // Заголовок шлём для ЛЮБОЙ секции: обязателен он только для резидентки и скрапера,
+            // остальные его игнорируют, а анти-фрод и атрибуция от него зависят везде.
+            ...(taken.fingerprint ? { headers: { [FINGERPRINT_HEADER]: taken.fingerprint } } : {})
+        });
     }
 
     /**
@@ -936,9 +1126,14 @@ class ProxySellerUserApi {
 
     /**
      * Create an order Resident. Attention! Deducts money from the balance.
+     *
+     * Требует X-Fingerprint: без него сервер отвечает "Header X-Fingerprint is required" и
+     * пакет не создаётся. Задайте значение через setFingerprint() / конструктор либо
+     * положите его в options как fingerprint — иначе SDK падает локально.
      * @param {string|object} tarifId tariff ObjectId or its code; object = whole payload
      * @param {string} coupon
-     * @param {object} options fields with no positional slot: paymentId/paymentCode, tarifCode, ...
+     * @param {object} options fields with no positional slot: paymentId/paymentCode, tarifCode,
+     *        fingerprint, ...
      */
     async orderMakeResident(tarifId, coupon = null, options = {}) {
         return this.orderMake(this.prepareResident(tarifId, coupon, options));
@@ -1013,14 +1208,7 @@ class ProxySellerUserApi {
                 payload[key] = values[key];
             }
         }
-        for (const [idKey, codeKey] of [['periodId', 'periodCode'], ['paymentId', 'paymentCode']]) {
-            if (Object.prototype.hasOwnProperty.call(values, codeKey) && values[codeKey] != null) {
-                delete payload[idKey];
-            } else if (Object.prototype.hasOwnProperty.call(values, idKey) && values[idKey] != null) {
-                delete payload[codeKey];
-            }
-        }
-        return this.filterEmpty(payload);
+        return this.filterEmpty(this._resolveReferencePairs(payload, PROLONG_REFERENCE_PAIRS));
     }
 
     /**
@@ -1055,37 +1243,186 @@ class ProxySellerUserApi {
      * @param {string} periodId ObjectId or period code (e.g. '1m') — prolong runs the same fallback
      * @param string coupon
      * @return object {orderId, total, balance, listBaseOrderNumbers}
-     * @throws ApiError при нехватке средств — продление НЕ состоялось
+     * @throws ApiError при нехватке средств: продление НЕ состоялось, причина приходит как
+     *         code 16 "Insufficient funds on balance", а расчёт с warning/balance/total
+     *         остаётся доступен в error.body.data
      */
     async prolongMake(type, ipsOrIds, periodId = null, coupon = '', options = {}) {
-        return this._assertProlongMade(await this.request('post', 'prolong/make/' + this._pathSegment(type), {
+        // Отдельная пост-проверка результата больше не нужна: нехватку средств сервер кладёт
+        // в errors[{code:16}] (ProlongMakeResponseClientDto.ofInsufficientFunds), и общий
+        // разбор конверта в request() бросает ApiError сам, сохранив calc-данные в error.body.
+        // Прежняя обёртка писалась под форму "status:error + ПУСТОЙ errors[]" и после правки
+        // сервера умела только одно: превращать легитимный success с пустым orderId в
+        // фальшивую ошибку, теряя total/balance/listBaseOrderNumbers уже ПОСЛЕ списания денег.
+        return this.request('post', 'prolong/make/' + this._pathSegment(type), {
             data: this.prepareProlong(ipsOrIds, periodId, coupon, options)
-        }));
+        });
+    }
+
+    /////////////////////////////// Autoprolong ///////////////////////////////
+
+    /**
+     * Тело autoprolong/*: то же, что у prolong/* (ids/ips/orderSeparatorIds,
+     * periodId/periodCode, paymentId/paymentCode), плюс subscriptionId и tarifId.
+     *
+     * Купона здесь нет специально: автопродление промокоды НЕ применяет нигде, и сервер
+     * сознательно не передаёт coupon в расчёт — иначе превью показывало бы цену со скидкой,
+     * которой в день списания не будет.
+     *
+     * Snake-алиасы (payment_id, subscription_id, tarif_id, tariffId) на входе принимаются, но в
+     * тело уходит каноническое camelCase-написание: на сервере camelCase старше snake_case, и
+     * отправлять оба сразу незачем.
+     * @param {array|string|object} ipsOrIds адреса/ObjectId, либо объект = всё тело целиком
+     * @param {string} periodId ObjectId or period code (e.g. '1m')
+     * @param {object} options subscriptionId, tarifId, orderSeparatorIds, paymentId/paymentCode
+     * @return {object}
+     */
+    prepareAutoProlong(ipsOrIds, periodId, options = {}) {
+        const isPayload = ipsOrIds && typeof ipsOrIds === 'object' && !Array.isArray(ipsOrIds);
+        const extra = options && typeof options === 'object' && !Array.isArray(options)
+            ? options
+            : {};
+        const values = this._normalizeAutoProlongAliases(isPayload ? { ...ipsOrIds, ...extra } : extra);
+        // Купон явно null: у prepareProlong он позиционный, а автопродлению не нужен.
+        const payload = this.prepareProlong(isPayload ? values : ipsOrIds, periodId, null, values);
+        for (const key of ['subscriptionId', 'tarifId']) {
+            if (Object.prototype.hasOwnProperty.call(values, key)) {
+                payload[key] = values[key];
+            }
+        }
+        return this.filterEmpty(payload);
     }
 
     /**
-     * При нехватке средств prolong/make отдаёт конверт status="error" с ПУСТЫМ errors[] и
-     * calc-данными в data (ProlongMakeResponseClientDto.ofInsufficientFunds,
-     * ClientApiService:3185) — ровно ту же форму, что легитимный warning у prolong/calc.
-     * Из-за этого общая ветка разбора конверта возвращала данные как успех, и несостоявшееся
-     * продление выглядело как состоявшееся. Успех определяется непустым orderId.
-     *
-     * order/make этим не страдает: у OrderMakeResponseClientDto только ofSuccess/ofError,
-     * и при ошибке errors[] всегда заполнен.
-     * @param {*} data
+     * Приводит snake-алиасы к каноническому написанию. Если рядом уже лежит camelCase-ключ,
+     * алиас отбрасывается — тот же приоритет, что у AutoProlongRequestClientDto.applyAliases.
+     * @param {object} values
      * @return {object}
      */
-    _assertProlongMade(data) {
-        if (!data || typeof data !== 'object' || Array.isArray(data)) {
-            return data;
+    _normalizeAutoProlongAliases(values) {
+        const normalized = {};
+        for (const [key, value] of Object.entries(values)) {
+            const canonical = AUTO_PROLONG_ALIASES[key] || key;
+            if (canonical !== key && Object.prototype.hasOwnProperty.call(values, canonical)) {
+                continue;
+            }
+            normalized[canonical] = value;
         }
-        if (data.orderId != null && String(data.orderId).trim() !== '') {
-            return data;
+        return normalized;
+    }
+
+    /**
+     * Скрапер автопродления не имеет: трафик к нему докупается новым заказом, и сервер отвечает
+     * "Create new order to add traffic, prolong options not available" — проверка стоит ДО
+     * резолва типа, так что запрос отбивается целиком. Резидентка сюда НЕ попадает: её
+     * autoprolong обслуживает ClientApiAutoProlongRouter, там тип поддержан.
+     * @param {*} type
+     * @param {string} action
+     * @throws ApiError
+     */
+    _assertAutoProlongType(type, action) {
+        if (String(type == null ? '' : type).trim().toLowerCase() !== 'scraper') {
+            return;
         }
-        const warning = data.warning != null ? String(data.warning).trim() : '';
-        throw new ApiError(warning || 'prolong/make did not create an order (insufficient funds)', {
-            httpStatus: 200,
-            body: data
+        throw new ApiError(
+            `autoprolong/${action}/scraper is not supported: a scraper package is extended by ` +
+            'buying traffic with orderMake(), so the server answers "Create new order to add ' +
+            'traffic, prolong options not available".'
+        );
+    }
+
+    /**
+     * Платёжка для calc/enable ОБЯЗАТЕЛЬНА — в отличие от prolong/*, где её можно не слать:
+     * списание произойдёт без клиента, и «по умолчанию с баланса» было бы догадкой за него.
+     * Сервер отвечает "Set [paymentId]"; проверяем локально, раз остальные обязательные поля
+     * SDK уже проверяет. Принимаются только balance и paddle_subscription.
+     * @param {object} payload
+     * @param {string} action
+     * @throws ApiError
+     */
+    _assertAutoProlongPayment(payload, action) {
+        const filled = (v) => v != null && String(v).trim() !== '';
+        if (filled(payload.paymentId) || filled(payload.paymentCode)) {
+            return;
+        }
+        throw new ApiError(
+            `autoprolong/${action} requires a payment system (the server answers "Set [paymentId]"): ` +
+            'the charge happens while you are away, so it cannot be guessed. Pass paymentId / ' +
+            'paymentCode or set it once with setPaymentId() / setPaymentCode(); only balance and ' +
+            'paddle_subscription are accepted, and paddle_subscription also needs subscriptionId.'
+        );
+    }
+
+    /**
+     * Calculate the upcoming automatic extension charge. Ничего не меняет и не списывает.
+     *
+     * data: warning, balance, total, quantity, currency, discount, orders, items[], days,
+     * tarifId (только резидентка), chargeDate, dateEnd, paymentId (канонический КОД платёжки),
+     * autoProlong. Даты — строки 'yyyy-MM-dd HH:mm:ss'.
+     *
+     * chargeDate — это НЕ дата окончания: сервер держит два механизма автопродления, один
+     * списывает за сутки до окончания, другой в день окончания, и значение считается по
+     * действующему. У резидентки chargeDate всегда null (пакет продлевается по дате ИЛИ по
+     * исчерпанию трафика — одной датой это не выразить), там смотрите dateEnd.
+     *
+     * Нехватка баланса — НЕ исключение: приходит status="error" с ЗАПОЛНЕННЫМ data и ПУСТЫМ
+     * errors[] (та же форма, что у prolong/calc), и метод вернёт расчёт с текстом в warning.
+     * @param string type - ipv4 | ipv6 | mobile | isp | mix | mix_isp | resident
+     * @param {array|string|object} ipsOrIds адреса/ObjectId; для type='resident' не нужны —
+     *        единица правки там ПАКЕТ, тело состоит из paymentId и необязательного tarifId
+     * @param {string} periodId ObjectId or period code (e.g. '1m'); резидентке не нужен —
+     *        период берётся из её тарифа
+     * @param {object} options subscriptionId, tarifId, orderSeparatorIds, paymentId/paymentCode
+     * @return object
+     * @throws ApiError при type='scraper' и без платёжки
+     */
+    async autoProlongCalc(type, ipsOrIds = null, periodId = null, options = {}) {
+        this._assertAutoProlongType(type, 'calc');
+        const payload = this.prepareAutoProlong(ipsOrIds, periodId, options);
+        this._assertAutoProlongPayment(payload, 'calc');
+        return this.request('post', 'autoprolong/calc/' + this._pathSegment(type), { data: payload });
+    }
+
+    /**
+     * Enable automatic extension for proxies. Сейчас ничего не списывается — платёжка и период
+     * лишь привязываются к выбранным прокси.
+     *
+     * data: autoProlong, quantity, ids[], days, paymentId, chargeDate, dateEnd.
+     * quantity/ids — то, что РЕАЛЬНО затронуто, а не эхо запроса: у ipv6 автопродление
+     * включается целым заказом, так что один адрес включает их все. У резидентки приходит
+     * quantity=1 и пустой ids — единица правки там пакет.
+     * @param string type - ipv4 | ipv6 | mobile | isp | mix | mix_isp | resident
+     * @param {array|string|object} ipsOrIds адреса/ObjectId; для type='resident' не нужны
+     * @param {string} periodId ObjectId or period code (e.g. '1m'); резидентке не нужен
+     * @param {object} options subscriptionId (обязателен для paddle_subscription), tarifId,
+     *        orderSeparatorIds, paymentId/paymentCode
+     * @return object
+     * @throws ApiError при type='scraper' и без платёжки
+     */
+    async autoProlongEnable(type, ipsOrIds = null, periodId = null, options = {}) {
+        this._assertAutoProlongType(type, 'enable');
+        const payload = this.prepareAutoProlong(ipsOrIds, periodId, options);
+        this._assertAutoProlongPayment(payload, 'enable');
+        return this.request('post', 'autoprolong/enable/' + this._pathSegment(type), { data: payload });
+    }
+
+    /**
+     * Disable automatic extension for proxies. Сбрасывает и период, и платёжку, поэтому
+     * ни periodId, ни paymentId здесь не нужны — только выбор прокси. Для type='resident'
+     * тело не нужно вовсе: пакет адресуется по apiKey.
+     *
+     * В ответе days/paymentId/chargeDate приходят null, а dateEnd остаётся — прокси не
+     * исчезает, он просто перестаёт продлеваться сам.
+     * @param string type - ipv4 | ipv6 | mobile | isp | mix | mix_isp | resident
+     * @param {array|string|object} ipsOrIds адреса/ObjectId; для type='resident' не нужны
+     * @param {object} options orderSeparatorIds и прочие поля тела
+     * @return object
+     * @throws ApiError при type='scraper'
+     */
+    async autoProlongDisable(type, ipsOrIds = null, options = {}) {
+        this._assertAutoProlongType(type, 'disable');
+        return this.request('post', 'autoprolong/disable/' + this._pathSegment(type), {
+            data: this.prepareAutoProlong(ipsOrIds, null, options)
         });
     }
 
@@ -1115,7 +1452,9 @@ class ProxySellerUserApi {
      *        package_key работает ТОЛЬКО на type='subresident'. Литеральный маршрут
      *        /proxy/download/resident обслуживается ResidentUserController.downloadProxyList,
      *        который знает лишь listId|id|ext|maxLine, а package_key молча игнорирует и отдаёт
-     *        выгрузку РОДИТЕЛЬСКОГО пакета.
+     *        выгрузку РОДИТЕЛЬСКОГО пакета. По той же причине при type='resident' молча
+     *        выбрасываются proto, country и ends — для резидентки берите
+     *        proxyDownloadResident(), у неё есть maxLine.
      * @return string
      * @throws ApiError при package_key вместе с type='resident'
      */
@@ -1194,13 +1533,22 @@ class ProxySellerUserApi {
     }
 
     /**
-     * Set proxy comment
+     * Set proxy comment.
+     *
+     * comment — поле ОБЯЗАТЕЛЬНОЕ, и очистка комментария выражается пустой строкой, а не null:
+     * по умолчанию раньше уезжал comment: null, то есть заведомо неверное для контракта тело.
+     * Пропущенное и null-значение трактуем как очистку ('').
+     *
+     * HTML-теги сервер вырезает при записи (<b>x</b> -> x), остальное — '&', кавычки, не-ASCII —
+     * хранит дословно, так что «прочитал из proxy/list и записал обратно» ничего не меняет.
      * @param array ids Any id, regardless of the type of proxy
-     * @param string comment
+     * @param string comment пустая строка очищает комментарий
      * @return integer Count updated proxy
      */
-    async proxyCommentSet(ids, comment = null) {
-        return (await this.request('post', 'proxy/comment/set', { data: { ids: ids, comment: comment } })).updated;
+    async proxyCommentSet(ids, comment = '') {
+        return (await this.request('post', 'proxy/comment/set', {
+            data: { ids: ids, comment: comment == null ? '' : comment }
+        })).updated;
     }
 
     /////////////////////////////// Resident ///////////////////////////////

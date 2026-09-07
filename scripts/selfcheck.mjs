@@ -59,6 +59,25 @@ async function expectApiError(fn, substring) {
     }
 }
 
+/**
+ * Перехватывает request(), чтобы проверить СОБРАННЫЙ запрос (URI, тело, заголовки), не выходя
+ * в сеть: настоящий вызов не делается, вместо ответа отдаётся заглушка.
+ * @return {array} перехваченные вызовы {method, uri, options}
+ */
+async function captureRequest(client, fn, response = {}) {
+    const calls = [];
+    client.request = async (method, uri, options = {}) => {
+        calls.push({ method: method, uri: uri, options: options });
+        return response;
+    };
+    try {
+        await fn();
+    } finally {
+        delete client.request;
+    }
+    return calls;
+}
+
 const api = new ProxySellerUserApi({ key: 'SELFCHECK_KEY' });
 
 /////////////////////////////// assertTargetName ///////////////////////////////
@@ -214,14 +233,23 @@ await check('autotopup set: неизвестные поля отбрасываю
 await check('autotopup set: полный набор полей доезжает целиком', () => {
     assertEqual(
         api._autoTopupSetBody({
-            enabled: true, threshold: 5, amount: 25, subscriptionId: 'sub_1',
-            dailyCountCap: 3, monthlyAmountCap: 300
+            enabled: true, threshold: 5, amount: 25, subscriptionId: 'sub_1'
         }),
         {
-            enabled: true, threshold: 5, amount: 25, subscriptionId: 'sub_1',
-            dailyCountCap: 3, monthlyAmountCap: 300
+            enabled: true, threshold: 5, amount: 25, subscriptionId: 'sub_1'
         }
     );
+});
+
+// dailyCountCap/monthlyAmountCap убраны из контракта 18.08.2026: сервер их молча
+// игнорирует, поэтому отправка выглядела бы успехом, ничего не изменившим. Отбиваем
+// по имени — ровно то, ради чего белый список полей и существует.
+await check('autotopup set: удалённые из контракта лимиты отбиваются по имени', () => {
+    for (const field of ['dailyCountCap', 'monthlyAmountCap']) {
+        let threw = false;
+        try { api._autoTopupSetBody({ [field]: 3 }); } catch { threw = true; }
+        if (!threw) throw new Error(`${field} обязан отбиваться локально`);
+    }
 });
 
 await check('autotopup set: пустое тело — локальная ApiError', () =>
