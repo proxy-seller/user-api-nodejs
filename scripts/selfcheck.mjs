@@ -406,6 +406,35 @@ await check('order/calc mix: код пакета уезжает в mixId', () =>
     assert(!('countryId' in payload), `countryId must not be sent, got ${JSON.stringify(payload)}`);
 });
 
+/////////////////////////////// order/list ///////////////////////////////
+
+// Имена фильтров order/list — snake_case из v1 (OrderController.orderList), а не camelCase
+// proxy/list: ту же ручку через обратное зеркало зовут клиенты легаси-API, и переименование
+// сломало бы их молча — запрос бы ушёл, фильтр бы не применился.
+await check('order/list: фильтры уходят под именами v1', async () => {
+    const listClient = new ProxySellerUserApi({ key: 'SELFCHECK_KEY' });
+    const filters = {
+        order_id: 'ORDER_OBJECT_ID', start_date: '01.06.2023', end_date: '30.06.2023',
+        status: 'PAYED', is_extend: 'Y', auto_order: 'N', page: 1, limit: 20,
+        sort_by: 'date_insert', order: 'desc'
+    };
+    const calls = await captureRequest(listClient, () => listClient.orderList(filters));
+    assertEqual(calls.length, 1, 'ожидался ровно один запрос');
+    assertEqual(calls[0].method, 'get', 'order/list — это GET');
+    assertEqual(calls[0].uri, 'order/list', 'неверный путь');
+    assertEqual(calls[0].options.params, filters, 'фильтры переименованы или потеряны');
+});
+
+await check('order/list: все фильтры опциональны, null не уезжает', async () => {
+    const listClient = new ProxySellerUserApi({ key: 'SELFCHECK_KEY' });
+    const empty = await captureRequest(listClient, () => listClient.orderList());
+    assertEqual(empty[0].options.params, {}, 'без фильтров params должен быть пустым');
+
+    const partial = await captureRequest(
+        listClient, () => listClient.orderList({ order_id: null, status: 'NOT_PAYED' }));
+    assertEqual(partial[0].options.params, { status: 'NOT_PAYED' }, 'null не отфильтрован');
+});
+
 /////////////////////////////// итог ///////////////////////////////
 
 if (failures.length > 0) {

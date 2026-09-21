@@ -1139,6 +1139,30 @@ class ProxySellerUserApi {
         return this.orderMake(this.prepareResident(tarifId, coupon, options));
     }
 
+    /**
+     * List of orders
+     *
+     * Возвращает не плоский список, а пару metadata + items — форма v1, потому что ту же
+     * выдачу через обратное зеркало получают клиенты легаси-API. metadata есть всегда: без
+     * limit там total_pages = 1, current_limit = 0, а весь список лежит в items.
+     *
+     * id, order_id, order_number, base_order_number и items[].order_part_id — СТРОКИ; id —
+     * легаси-число битрикса либо суррогат от base_order_number, наш ObjectId лежит в order_id
+     * (тот же, что order_id в proxyList). summ и вложенные items[].price — тоже строки, уже с
+     * валютой ('$25.00'), auto_order / is_extend — 'Y'/'N', даты — ISO 8601 со смещением ('2026-09-01T14:15:26+00:00').
+     *
+     * @param {*} filters order_id | start_date | end_date | status | is_extend | auto_order |
+     *                    page | limit | sort_by | order — все опциональны, имена snake_case,
+     *                    как в v1. status — PAYED | NOT_PAYED | RETURN (это status_type ответа,
+     *                    а не человекочитаемый status), is_extend / auto_order — 'Y'/'N',
+     *                    sort_by — date_insert | summ | status, order — asc | desc
+     * @return object
+     */
+    async orderList(filters = {}) {
+        const params = this.filterEmpty(filters);
+        return this.request('get', 'order/list', { params: params });
+    }
+
     /////////////////////////////// Prolong ///////////////////////////////
 
     /**
