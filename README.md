@@ -588,8 +588,18 @@ await api.proxyList('ipv4', { orderId: 'ORDER_OBJECT_ID', latest: 'Y' });
 await api.proxyCommentSet(['IP_ID_1', 'IP_ID_2'], 'my comment');
 ```
 
-`orderId` is an ObjectId string. Filters: `latest`, `orderId`, `country`, `ends`, and
-`page` / `per_page` for the typed route.
+Filters: `latest`, `orderId`, `country`, `ends`, and `page` / `per_page` for the typed route.
+
+- `latest: 'Y'` returns only the proxies of the latest order among those the request returns:
+  with a type, the latest order of that type (`mix` / `mix_isp` — the latest MIX order); without
+  a type, one latest order for the whole response, so the other sections come back empty. The
+  latest order is the last one bought — a renewal does not count. It is ignored when `orderId`
+  is set and has no effect on `resident` and `scraper`.
+- `orderId` takes any order identifier the API returns: `order_id` (from `proxyList()` or
+  `orderList()`), the numeric `id` of an `orderList()` row (a renewal row selects the order it
+  renews), or the order number — the current `order_number`, `base_order_number`, or an earlier
+  number of a renewed order with an older `_e_<hash>` suffix. An unknown order or one of another
+  account returns empty lists.
 
 ### Replacing IPs
 

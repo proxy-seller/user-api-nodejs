@@ -1996,7 +1996,15 @@ class ProxySellerUserApi {
      * List of proxies
      * @param string type - ipv4 | ipv6 | mobile | isp | mix | resident | null
      * @param {*} filters latest | orderId | country | ends | page | per_page
-     *                    orderId — ObjectId-строка, не число
+     *                    latest: 'Y' — только прокси последнего заказа среди тех, что вернул бы
+     *                    запрос: с типом — последнего заказа этого типа (mix / mix_isp —
+     *                    последнего MIX), без типа — один последний заказ на весь ответ.
+     *                    «Последний» — по покупке, продление не в счёт. С orderId
+     *                    игнорируется, на resident и scraper не действует.
+     *                    orderId — любой идентификатор заказа из ответов API: order_id
+     *                    (proxyList / orderList), числовой id строки orderList (id строки
+     *                    продления — её заказ) или номер: текущий order_number,
+     *                    base_order_number либо прежний номер продлённого заказа (_e_<hash>)
      * @return object
      */
     async proxyList(type = null, filters = {}) {
