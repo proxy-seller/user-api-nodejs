@@ -5,8 +5,7 @@ import axios from 'axios';
  *
  * Ошибки доступа (битый ключ / IP не в allowlist / превышен лимит запросов) приходят
  * с HTTP 200 и ФИКСИРОВАННОЙ тройкой в errors[] — "Error api key", "IP not allowed <ip>",
- * "Request limit reached", все с code=503 (LegacyClientApiErrorResponseAdvice +
- * CustomHandlerInterceptor на бэкенде). Понять, что именно произошло, по errors[0] нельзя,
+ * "Request limit reached", все с code=503. Понять, что именно произошло, по errors[0] нельзя,
  * поэтому весь массив доступен в `error.errors` (и полный конверт — в `error.body`).
  */
 export class ApiError extends Error {
@@ -23,8 +22,8 @@ export class ApiError extends Error {
 }
 
 /**
- * proxy/replace: причина замены (НЕ тип прокси). Совпадает с enum ProxyReplaceType
- * на бэкенде; сервер приводит значение к upper case перед valueOf.
+ * proxy/replace: причина замены (НЕ тип прокси). Ровно этот набор причин принимает сервер;
+ * регистр ему не важен — значение приводится к upper case.
  */
 export const PROXY_REPLACE_TYPES = Object.freeze([
     'NOT_WORK', 'INCORRECT_LOCATION', 'CANT_CHANGE_NETWORK', 'LOW_SPEED', 'CUSTOM'
@@ -36,7 +35,7 @@ const AUTO_TOPUP_SET_FIELDS = Object.freeze([
 ]);
 
 /**
- * Убраны из контракта 18.08.2026 (AutoTopupSetRequestClientDto): сервер их больше не читает,
+ * Убраны из контракта balance/autotopup/set 18.08.2026: сервер их больше не читает,
  * коды ошибок 54/55 удалены и не переиспользуются, ключа minDailyCountCap в customData нет.
  * Раньше SDK их отправлял — вызов проходил локальный гейт, отвечал success и не делал НИЧЕГО.
  * Отбиваем локально, чтобы тихий no-op стал видимым.
@@ -44,10 +43,9 @@ const AUTO_TOPUP_SET_FIELDS = Object.freeze([
 const AUTO_TOPUP_REMOVED_FIELDS = Object.freeze(['dailyCountCap', 'monthlyAmountCap']);
 
 /**
- * Пары *Id / *Code с указанием СТАРШЕЙ половины — дословно так их разбирает сервер
- * (ClientApiService.normalizeOrderReferenceCodes). payment/country/period резолвятся от кода
- * (`if (code)`), а operator/rotation/mix/tarif — от идентификатора
- * (`if (code && !trimToNull(id))`): там код применяется, только когда парный id пуст.
+ * Пары *Id / *Code с указанием СТАРШЕЙ половины — дословно так их разбирает сервер.
+ * payment/country/period резолвятся от кода, а operator/rotation/mix/tarif — от
+ * идентификатора: там код применяется, только когда парный id пуст.
  *
  * Раньше SDK удалял *Id ВСЯКИЙ РАЗ, когда задан *Code, и для нижних четырёх пар это
  * инвертировало контракт: клиент, заполнивший обе половины, молча получал не тот
@@ -64,28 +62,48 @@ const ORDER_REFERENCE_PAIRS = Object.freeze([
 ]);
 
 /**
- * Пары *Id / *Code тела prolong/* и autoprolong/*: normalizeProlongReferenceCodes знает только
- * эти две, и обе резолвятся от кода.
+ * Пары *Id / *Code тела prolong/* и autoprolong/*: других пар сервер в этих телах не разбирает,
+ * и обе резолвятся от кода.
  */
 const PROLONG_REFERENCE_PAIRS = Object.freeze([
     ['periodId', 'periodCode', 'code'],
     ['paymentId', 'paymentCode', 'code']
 ]);
 
+/**
+ * prolong/* и autoprolong/*: типы, которые продаются и продлеваются только ЦЕЛЫМИ заказами.
+ * Выбор для них — orderIds (`order_id` из proxy/list или order/list). Остальные типы (ipv4,
+ * isp, mobile) продлеваются по отдельным прокси: ipIds (`id` из proxy/list) либо ips (адреса).
+ */
+const ORDER_PROLONG_TYPES = Object.freeze(['ipv6', 'mix', 'mix_isp']);
+
+/**
+ * Написания резидентской ветки autoprolong/*. Выбора у неё нет: автопродление применяется ко
+ * всему пакету, поэтому любой непустой выбор для неё — локальная ApiError, а не тихий пропуск:
+ * disable, адресованный паре адресов, выключил бы автопродление всего пакета.
+ */
+const RESIDENT_PROLONG_TYPES = Object.freeze(['resident', 'residential']);
+
+/** Поля выбора prolong/* и autoprolong/*: пустыми в тело не уходят. */
+const PROLONG_SELECTION_FIELDS = Object.freeze(['ipIds', 'ips', 'orderIds']);
+
+/**
+ * Поля тела prolong/* (и основы тела autoprolong/*), которые SDK берёт из options или из
+ * объектной формы вызова. ids, orderSeparatorIds и orderSeparatorId убраны из контракта, и
+ * сервер их больше не читает: переданные — локальная ApiError с именем замены (ipIds / ips для
+ * ipv4, isp, mobile и orderIds для ipv6, mix, mix_isp), см. _assertNoRemovedProlongFields().
+ */
+const PROLONG_BODY_FIELDS = Object.freeze([
+    ...PROLONG_SELECTION_FIELDS, 'coupon', 'periodId', 'periodCode', 'paymentId', 'paymentCode'
+]);
+
 /** Имя заголовка фингерпринта — единственное место, где оно записано. */
 const FINGERPRINT_HEADER = 'X-Fingerprint';
 
 /**
- * Секции order/make, которые без фингерпринта не создаются ВООБЩЕ: OrderService
- * .createResidentOrder / .createScraperOrder отвечают 400 "Header X-Fingerprint is required"
- * ещё до расчёта цены. Остальные секции заголовок игнорируют, слать его им безопасно.
- */
-const FINGERPRINT_REQUIRED_SECTIONS = Object.freeze(['resident', 'scraper']);
-
-/**
- * Snake-алиасы тела autoprolong/*, которые сервер принимает наравне с camelCase
- * (AutoProlongRequestClientDto.applyAliases). Приводим их к каноническому написанию:
- * camelCase на сервере старше, и отправлять оба написания сразу незачем.
+ * Snake-алиасы тела autoprolong/*, которые сервер принимает наравне с camelCase.
+ * Приводим их к каноническому написанию: camelCase на сервере старше, и отправлять оба
+ * написания сразу незачем.
  */
 const AUTO_PROLONG_ALIASES = Object.freeze({
     payment_id: 'paymentId',
@@ -94,18 +112,346 @@ const AUTO_PROLONG_ALIASES = Object.freeze({
     tariffId: 'tarifId'
 });
 
+/////////////////////////////// Очередь запросов ///////////////////////////////
+
+/**
+ * Значения очереди запросов по умолчанию (см. RequestQueue). Ключи — ровно опции rateLimit
+ * конструктора; смысл и значения те же, что в остальных SDK.
+ */
+const RATE_LIMIT_DEFAULTS = Object.freeze({
+    enabled: true,
+    requestsPerMinute: 1000,
+    writeIntervalMs: 1000,
+    moneyIntervalMs: 2000,
+    maxRetries: 3
+});
+
+/**
+ * Подменяемые часы и таймер очереди — для тестов с фальшивым временем:
+ * now() — миллисекунды по монотонным часам, sleep(ms) — промис, который резолвится через ms.
+ */
+const RATE_LIMIT_HOOKS = Object.freeze(['now', 'sleep']);
+
+/** Скользящее окно глобального лимита: не больше requestsPerMinute стартов за любые 60 с. */
+const RATE_LIMIT_WINDOW_MS = 60000;
+
+/** Пауза перед повтором 429, когда Retry-After нет или его не разобрать. */
+const RETRY_AFTER_FALLBACK_MS = 2000;
+
+/** Потолок паузы перед повтором 429, что бы ни прислал Retry-After. */
+const RETRY_AFTER_CAP_MS = 60000;
+
+/**
+ * Категории запросов для очереди — по ПУТИ, не по HTTP-методу: calc-эндпоинты шлются POST, но
+ * ничего не меняют. `{type}` совпадает с любым одним сегментом пути; пути, которого здесь нет, —
+ * read. Это единственное место, где записана классификация: request() берёт категорию только
+ * отсюда, через _requestCategory().
+ *   money — деньги: заказ, продление, пополнение баланса;
+ *   write — меняют состояние аккаунта;
+ *   read  — всё остальное: списки, get, calc, справочники, выгрузки, статистика.
+ */
+const REQUEST_CATEGORIES = Object.freeze({
+    'order/make': 'money',
+    'prolong/make/{type}': 'money',
+    'balance/add': 'money',
+
+    'autoprolong/enable/{type}': 'write',
+    'autoprolong/disable/{type}': 'write',
+    'auth/add': 'write',
+    'auth/add/ip': 'write',
+    'auth/change': 'write',
+    'auth/delete': 'write',
+    'proxy/replace': 'write',
+    'proxy/comment/set': 'write',
+    'balance/autotopup/set': 'write',
+    // resident/list — POST-алиас resident/list/add. Не путать с resident/lists: это список, read.
+    'resident/list': 'write',
+    'resident/list/add': 'write',
+    'resident/list/delete': 'write',
+    'resident/list/rename': 'write',
+    'resident/list/rotation': 'write',
+    'resident/list/tools': 'write',
+    'residentsubuser/create': 'write',
+    'residentsubuser/update': 'write',
+    'residentsubuser/delete': 'write',
+    'residentsubuser/list/add': 'write',
+    'residentsubuser/list/delete': 'write',
+    'residentsubuser/list/rename': 'write',
+    'residentsubuser/list/rotation': 'write',
+    'residentsubuser/list/tools': 'write'
+});
+
+/** REQUEST_CATEGORIES, заранее разрезанные на сегменты, — чтобы не резать шаблоны на каждый запрос. */
+const REQUEST_CATEGORY_PATTERNS = Object.freeze(Object.entries(REQUEST_CATEGORIES).map(
+    ([path, category]) => Object.freeze({ segments: Object.freeze(path.split('/')), category: category })
+));
+
+const noop = () => {};
+
+/** write и money идут через полосу записи; read — мимо неё. */
+function inWriteLane(category) {
+    return category === 'write' || category === 'money';
+}
+
+/**
+ * Значение заголовка ответа без учёта регистра имени: у настоящего ответа axios это AxiosHeaders
+ * (get() без учёта регистра), у подменённого транспорта может быть обычный объект. Из нескольких
+ * значений берётся первое.
+ * @param {*} headers
+ * @param {string} name имя в нижнем регистре
+ * @return {*}
+ */
+function responseHeader(headers, name) {
+    if (!headers || typeof headers !== 'object') {
+        return null;
+    }
+    let value = typeof headers.get === 'function' ? headers.get(name) : undefined;
+    if (value == null) {
+        const key = Object.keys(headers).find((candidate) => candidate.toLowerCase() === name);
+        value = key === undefined ? null : headers[key];
+    }
+    return Array.isArray(value) ? value[0] : value;
+}
+
+/**
+ * Пауза перед повтором 429 по Retry-After: целые секунды либо HTTP-дата. Нет заголовка или его
+ * не разобрать — 2 с; дольше 60 с не ждём. Дату сравниваем с настенными часами (Date.now()), а не
+ * с часами очереди: те монотонные, и с датой их не сравнить.
+ * @param {*} headers заголовки ответа 429
+ * @return {number} миллисекунды
+ */
+function retryAfterMs(headers) {
+    const raw = responseHeader(headers, 'retry-after');
+    const text = raw == null ? '' : String(raw).trim();
+    let wait = RETRY_AFTER_FALLBACK_MS;
+    if (/^\d+$/.test(text)) {
+        wait = Number(text) * 1000;
+    } else if (/[a-z]/i.test(text)) {
+        const at = Date.parse(text);
+        if (Number.isFinite(at)) {
+            wait = Math.max(0, at - Date.now());
+        }
+    }
+    return Math.min(wait, RETRY_AFTER_CAP_MS);
+}
+
+/**
+ * HTTP 429 — ответ лимита на входе, перед API: запрос до API не дошёл, поэтому повтор безопасен
+ * даже для money. Сам API за превышение лимита отвечает HTTP 200 с тройкой отказа доступа (code
+ * 503) — её очередь не повторяет, см. RequestQueue.
+ * @param {*} response
+ * @return {boolean}
+ */
+function isRateLimitedResponse(response) {
+    return response != null && Number(response.status) === 429;
+}
+
+/**
+ * Очередь запросов одного клиента: держит его под лимитами API, не требуя кода от вызывающего.
+ *
+ *  1. Глобальное окно. Все запросы — read, write и money — делят скользящее окно: не больше
+ *     requestsPerMinute стартов за любые 60 с. Это журнал стартов (ждём, пока самому старому из
+ *     последних N не исполнится 60 с), а НЕ token bucket: bucket пропускает всплески больше N за
+ *     60 с. Старты раздаются строго по очереди вызовов.
+ *  2. Полоса записи. write и money идут через ОДНУ полосу на клиент: в полёте не больше одного,
+ *     следующий стартует только после того, как предыдущий закончился, и вдобавок не раньше
+ *     writeIntervalMs после СТАРТА предыдущего write/money, а money — ещё и не раньше
+ *     moneyIntervalMs после старта предыдущего money. read полосу не ждёт — только окно.
+ *  3. HTTP 429. Ждём Retry-After (см. retryAfterMs) и повторяем, до maxRetries раз, затем отдаём
+ *     ответ 429 обычному разбору request() — выходит обычная ApiError с httpStatus 429. Повтор
+ *     write/money держит своё место в полосе (никто не влезает вперёд); каждая попытка — новый
+ *     старт в окне и новая точка отсчёта интервалов полосы.
+ *  4. Больше ничего не повторяется: ни ошибки в конверте — code 57 "Prolong for this order is
+ *     already in progress" (повтор мог бы продлить заказ дважды) и тройка отказа доступа code 503
+ *     (её не отличить от неверного ключа или IP), — ни сетевые ошибки, ни другие HTTP-статусы.
+ *
+ * Ждём только таймерами (sleep), без активного ожидания; вызывающему ожидание видно как более
+ * поздний resolve промиса. Состояние живёт в экземпляре клиента: другой экземпляр или другой
+ * процесс с тем же ключом о нём не знает и со своими запросами не согласует.
+ */
+class RequestQueue {
+    constructor(settings) {
+        const now = settings.now || (() => performance.now());
+        const sleep = settings.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+        this.requestsPerMinute = settings.requestsPerMinute;
+        this.writeIntervalMs = settings.writeIntervalMs;
+        this.moneyIntervalMs = settings.moneyIntervalMs;
+        this.maxRetries = settings.maxRetries;
+        // Вызываем как обычные функции, а не как методы очереди: переданный снаружи метод не должен
+        // получить эту очередь в качестве this.
+        this._now = () => now();
+        this._sleep = (ms) => sleep(ms);
+        /** Старты последних 60 с (по часам очереди), от старых к новым. */
+        this._starts = [];
+        this._windowTail = Promise.resolve();
+        this._laneTail = Promise.resolve();
+        this._lastWriteStart = -Infinity;
+        this._lastMoneyStart = -Infinity;
+    }
+
+    /**
+     * Проводит один запрос через очередь.
+     * @param {string} category read | write | money — см. REQUEST_CATEGORIES
+     * @param {function(): Promise<object>} send одна попытка: ответ транспорта либо его исключение
+     * @return {Promise<object>} ответ последней попытки
+     */
+    run(category, send) {
+        if (!inWriteLane(category)) {
+            return this._attempts(category, send);
+        }
+        const turn = this._laneTail.then(() => this._laneTurn(category, send));
+        // Хвост полосы никогда не отклоняется: упавший запрос освобождает полосу так же, как удачный.
+        this._laneTail = turn.then(noop, noop);
+        return turn;
+    }
+
+    /** Ход в полосе записи: предыдущий write/money уже закончился, ждём интервалы от его старта. */
+    async _laneTurn(category, send) {
+        for (;;) {
+            const now = this._now();
+            let notBefore = this._lastWriteStart + this.writeIntervalMs;
+            if (category === 'money') {
+                notBefore = Math.max(notBefore, this._lastMoneyStart + this.moneyIntervalMs);
+            }
+            if (now >= notBefore) {
+                break;
+            }
+            // Таймер может сработать чуть раньше срока — тогда цикл досыпает остаток.
+            await this._sleep(notBefore - now);
+        }
+        return this._attempts(category, send);
+    }
+
+    /** Попытки одного запроса: старт в окне, отправка, при 429 — пауза и повтор. */
+    async _attempts(category, send) {
+        for (let retry = 0; ; retry++) {
+            const started = await this._takeWindowSlot();
+            if (inWriteLane(category)) {
+                this._lastWriteStart = started;
+                if (category === 'money') {
+                    this._lastMoneyStart = started;
+                }
+            }
+            let response;
+            try {
+                response = await send();
+            } catch (error) {
+                // Сетевые и прочие исключения не повторяются. 429 исключением приходит, только если
+                // вызывающий переопределил validateStatus в options запроса.
+                if (retry >= this.maxRetries || !isRateLimitedResponse(error?.response)) {
+                    throw error;
+                }
+                await this._sleep(retryAfterMs(error.response.headers));
+                continue;
+            }
+            if (retry >= this.maxRetries || !isRateLimitedResponse(response)) {
+                return response;
+            }
+            await this._sleep(retryAfterMs(response.headers));
+        }
+    }
+
+    /**
+     * Место в глобальном окне. Старты раздаются по одному, в порядке запросов (цепочка промисов),
+     * чтобы при полном окне ожидающие не толкались за освободившееся место.
+     * @return {Promise<number>} время старта по часам очереди
+     */
+    _takeWindowSlot() {
+        const slot = this._windowTail.then(() => this._waitForWindow());
+        this._windowTail = slot.then(noop, noop);
+        return slot;
+    }
+
+    async _waitForWindow() {
+        for (;;) {
+            const now = this._now();
+            while (this._starts.length > 0 && now - this._starts[0] >= RATE_LIMIT_WINDOW_MS) {
+                this._starts.shift();
+            }
+            if (this._starts.length < this.requestsPerMinute) {
+                this._starts.push(now);
+                return now;
+            }
+            await this._sleep(this._starts[0] + RATE_LIMIT_WINDOW_MS - now);
+        }
+    }
+}
+
+/**
+ * Разбирает config.rateLimit конструктора и собирает очередь.
+ * undefined / null / true — всё по умолчанию; false — короткая запись { enabled: false }.
+ * Пропущенная (или null) опция берёт значение по умолчанию; неизвестная опция и неверное значение —
+ * ApiError: опечатка в имени иначе молча оставила бы значение по умолчанию.
+ * @param {*} rateLimit
+ * @return {RequestQueue|null} null — очередь выключена, request() шлёт как раньше
+ * @throws ApiError
+ */
+function createRequestQueue(rateLimit) {
+    if (rateLimit === false) {
+        return null;
+    }
+    const given = rateLimit === undefined || rateLimit === null || rateLimit === true ? {} : rateLimit;
+    const known = [...Object.keys(RATE_LIMIT_DEFAULTS), ...RATE_LIMIT_HOOKS];
+    if (typeof given !== 'object' || Array.isArray(given)) {
+        throw new ApiError(
+            `rateLimit must be an object with any of ${known.join(', ')}, or false to turn the request queue off`
+        );
+    }
+    const unknown = Object.keys(given).filter((key) => !known.includes(key));
+    if (unknown.length > 0) {
+        throw new ApiError(`Unknown rateLimit option(s): ${unknown.join(', ')}. Known options: ${known.join(', ')}`);
+    }
+    const settings = {};
+    for (const key of known) {
+        settings[key] = given[key] === undefined || given[key] === null ? RATE_LIMIT_DEFAULTS[key] : given[key];
+    }
+    const problems = [];
+    if (typeof settings.enabled !== 'boolean') {
+        problems.push('enabled must be true or false');
+    }
+    if (!Number.isInteger(settings.requestsPerMinute) || settings.requestsPerMinute < 1) {
+        problems.push('requestsPerMinute must be an integer >= 1');
+    }
+    for (const key of ['writeIntervalMs', 'moneyIntervalMs']) {
+        if (typeof settings[key] !== 'number' || !Number.isFinite(settings[key]) || settings[key] < 0) {
+            problems.push(`${key} must be a number of milliseconds >= 0`);
+        }
+    }
+    if (!Number.isInteger(settings.maxRetries) || settings.maxRetries < 0) {
+        problems.push('maxRetries must be an integer >= 0');
+    }
+    for (const key of RATE_LIMIT_HOOKS) {
+        if (settings[key] !== undefined && typeof settings[key] !== 'function') {
+            problems.push(`${key} must be a function`);
+        }
+    }
+    if (problems.length > 0) {
+        throw new ApiError(`Invalid rateLimit: ${problems.join('; ')}`);
+    }
+    return settings.enabled ? new RequestQueue(settings) : null;
+}
+
 class ProxySellerUserApi {
     URL = 'https://proxy-seller.com/personal/api/v2/';
     paymentId = null
     paymentCode = null
     generateAuth = 'N'
     fingerprint = null
+    /** Очередь запросов клиента (см. RequestQueue); null — выключена через rateLimit. */
+    requestQueue = null
 
     /**
      * Key placed in https://proxy-seller.com/personal/api/ — уходит в ПУТЬ запроса,
      * не в заголовок.
      *
      * config.fingerprint — значение заголовка X-Fingerprint, см. setFingerprint().
+     *
+     * config.rateLimit — очередь запросов, включена по умолчанию (см. RequestQueue и раздел
+     * README «Rate limits and the request queue»): { enabled, requestsPerMinute, writeIntervalMs,
+     * moneyIntervalMs, maxRetries }, по умолчанию { true, 1000, 1000, 2000, 3 }. Пропущенная опция
+     * берёт значение по умолчанию, false — то же, что { enabled: false }: запросы уходят сразу и без
+     * повторов, как до появления очереди. Для тестов с фальшивым временем — now() (мс, монотонные
+     * часы) и sleep(ms) → Promise. В axios rateLimit не передаётся.
      * @param {*} config
      * @throws ApiError
      */
@@ -123,6 +469,7 @@ class ProxySellerUserApi {
             timeout = 30000,
             headers = {},
             fingerprint = null,
+            rateLimit,
             ...axiosConfig
         } = config;
         const apiRoot = String(baseUrl || baseURL || this.URL).replace(/\/+$/, '') + '/';
@@ -130,6 +477,8 @@ class ProxySellerUserApi {
         this.baseURL = apiRoot + encodeURIComponent(key) + '/';
         this.timeout = timeout;
         this.setFingerprint(fingerprint);
+        // Состояние очереди — в экземпляре, то есть на один ключ в одном процессе.
+        this.requestQueue = createRequestQueue(rateLimit);
         this.client = axios.create({
             ...axiosConfig,
             baseURL: this.baseURL,
@@ -142,9 +491,14 @@ class ProxySellerUserApi {
     }
 
     /**
-     * Payment system id (MongoDB ObjectId from balance/payments/list).
-     * For order/* and prolong/* a stable payment code is accepted here too — the server retries the
-     * value as a code when it is not a valid id. balance/add takes the ObjectId only.
+     * Payment system id (MongoDB ObjectId).
+     *
+     * balance/add takes the ObjectId of a top-up system from balance/payments/list — and only
+     * that. order/*, prolong/* and autoprolong/* accept just two payment systems, the account
+     * balance and the saved card; the top-up systems from that list are rejected there, and the
+     * balance itself is never listed. For orders and renewals prefer setPaymentCode('balance') /
+     * setPaymentCode('paddle_subscription'); a code passed here works too — the server retries
+     * the value as a code when it is not a valid id.
      * @param string id
      */
     setPaymentId(id) {
@@ -156,9 +510,10 @@ class ProxySellerUserApi {
     }
 
     /**
-     * Stable payment-system code (for example `balance`). Resolved by order/* and prolong/* only —
-     * balance/add needs setPaymentId(). balance/payments/list returns id + name, no code, so the
-     * codes are not discoverable through the API.
+     * Stable payment-system code for order/*, prolong/* and autoprolong/*: `balance` (the account
+     * balance) or `paddle_subscription` (the card saved on the account) — the only two they
+     * accept, since a one-off checkout ends on a hosted page a headless client cannot complete.
+     * balance/add does not resolve codes and needs setPaymentId().
      */
     setPaymentCode(code) {
         this.paymentCode = code
@@ -184,10 +539,9 @@ class ProxySellerUserApi {
     /**
      * X-Fingerprint — стабильный идентификатор УСТАНОВКИ клиента, уходит заголовком в order/make.
      *
-     * Контракт объявляет заголовок обязательным на всей операции, но реально его требуют только
-     * резидентские и скраперные заказы: без него сервер отвечает
-     * "Header X-Fingerprint is required" и заказ не создаётся вовсе. Прочие секции заголовок
-     * игнорируют, поэтому SDK шлёт его всегда, когда значение задано.
+     * Заголовок необязателен: заказы по API-ключу сервер создаёт и без него, в том числе
+     * резидентские и скраперные. SDK шлёт его в order/make для любой секции, когда значение
+     * задано, и не шлёт и не требует, когда его нет.
      *
      * Форма значения не проверяется — подойдёт любая непрозрачная непустая строка. SDK её НЕ
      * генерирует сам: заголовок введён ради анти-фрода и affiliate-атрибуции, а случайное
@@ -209,6 +563,11 @@ class ProxySellerUserApi {
     /**
      * Send request into server
      *
+     * Единственное место, где SDK отправляет HTTP-запросы, и в него же встроена очередь запросов
+     * (config.rateLimit, см. RequestQueue): категория берётся по пути (_requestCategory), запрос
+     * ждёт своей очереди, HTTP 429 повторяется. Ожидание лишь откладывает resolve промиса. Без
+     * очереди (rateLimit.enabled = false) запрос уходит сразу и без повторов — ровно как до неё.
+     *
      * options.headers кладутся ПОВЕРХ заголовков клиента (axios мержит их с дефолтами
      * инстанса), не заменяя их: так order/make добавляет X-Fingerprint, не трогая
      * Content-Type и то, что передали в конструктор.
@@ -220,13 +579,17 @@ class ProxySellerUserApi {
      */
     async request(method, uri, options = {}) {
         const { method: ignoredMethod, url: ignoredUrl, baseURL: ignoredBaseURL, ...requestOptions } = options;
+        // Функция, а не готовый промис: очередь зовёт её на каждую попытку, в том числе на повтор 429.
+        const send = () => this.client.request({
+            ...requestOptions,
+            method: method,
+            url: uri
+        });
         let response;
         try {
-            response = await this.client.request({
-                ...requestOptions,
-                method: method,
-                url: uri
-            });
+            response = this.requestQueue
+                ? await this.requestQueue.run(this._requestCategory(uri), send)
+                : await send();
         } catch (error) {
             throw new ApiError(error?.message || 'Client API request failed', {
                 code: error?.code ?? null,
@@ -278,6 +641,22 @@ class ProxySellerUserApi {
         }
 
         return data;
+    }
+
+    /**
+     * Категория запроса для очереди — money | write | read — по пути из REQUEST_CATEGORIES, а не
+     * по HTTP-методу. Путь сравнивается посегментно, без query-строки, лишних слэшей и регистра;
+     * `{type}` — любой один сегмент. Чего нет в таблице, то read.
+     * @param {string} uri путь относительно корня API — тот, что получает request()
+     * @return {string}
+     */
+    _requestCategory(uri) {
+        const segments = String(uri == null ? '' : uri).split(/[?#]/, 1)[0]
+            .trim().toLowerCase().split('/').filter(Boolean);
+        const match = REQUEST_CATEGORY_PATTERNS.find((pattern) =>
+            pattern.segments.length === segments.length &&
+            pattern.segments.every((part, index) => part === '{type}' || part === segments[index]));
+        return match ? match.category : 'read';
     }
 
     toApiError(error, httpStatus, body, errors = null) {
@@ -354,13 +733,13 @@ class ProxySellerUserApi {
      * Explicit per-call values take precedence over values configured on the client.
      *
      * countryId / periodId / paymentId / operatorId / mixId / tarifId accept an ObjectId OR the
-     * corresponding stable code: normalizeOrderReferenceCodes on the server retries the value as
-     * a code whenever it is not a valid id and the paired *Code field is empty. The separate
-     * *Code fields are therefore optional, not the only way to pass a code.
+     * corresponding stable code: the server retries the value as a code whenever it is not a
+     * valid id and the paired *Code field is empty. The separate *Code fields are therefore
+     * optional, not the only way to pass a code.
      *
      * rotationId is NOT an id and has NO code: it is the rotation interval in minutes
-     * (0 = By Link, 5, 10, 60...). rotationCode is only copied into rotationId after an
-     * isInteger() check, so '5m' / '10m' are always rejected with
+     * (0 = By Link, 5, 10, 60...). The server copies rotationCode into rotationId only when it
+     * is an integer, so '5m' / '10m' are always rejected with
      * "Set existed [rotationCode] from reference".
      *
      * Когда заполнены обе половины пары, лишняя убирается по ПРИОРИТЕТУ СЕРВЕРА
@@ -392,7 +771,7 @@ class ProxySellerUserApi {
      *
      * Пустое значение ('' и пробелы) считается НЕзаданным. Раньше проверка была на `!= null`,
      * из-за чего `*Code: ''` стирал валидный парный `*Id`, и заказ уезжал без ссылки на
-     * справочник — сервер сам трактует пустую строку как отсутствие (trimToNull).
+     * справочник — сервер сам трактует пустую строку как отсутствие значения.
      * @param {object} payload
      * @param {array} pairs
      * @return {object}
@@ -503,10 +882,9 @@ class ProxySellerUserApi {
      * Replenish the balance.
      *
      * ВНИМАНИЕ: balance/add принимает ТОЛЬКО paymentId (ObjectId-строка из
-     * balance/payments/list). Стабильные коды платёжных систем здесь НЕ резолвятся:
-     * BalanceAddRequestClientDto знает лишь `summ` и `paymentId`, а
-     * normalizeOrderReferenceCodes (то, что резолвит коды в order/prolong) в addBalance
-     * не вызывается. setPaymentCode() на этот эндпоинт не влияет.
+     * balance/payments/list). Стабильные коды платёжных систем здесь НЕ резолвятся: тело
+     * эндпоинта — лишь `summ` и `paymentId`, а резолва кодов, который работает в order/* и
+     * prolong/*, здесь нет. setPaymentCode() на этот эндпоинт не влияет.
      *
      * @param {number} summ сумма пополнения (минимум задаётся на сервере, по умолчанию > 1)
      * @param {string|{paymentId?: string, paymentCode?: string}} paymentId ObjectId платёжной системы
@@ -542,7 +920,11 @@ class ProxySellerUserApi {
     }
 
     /**
-     * List of payment systems for balance replenishing
+     * List of payment systems for balance replenishing — the ids balanceAdd() takes.
+     *
+     * Not a list of ways to pay for orders: the account balance is never in it, and order/*,
+     * prolong/* and autoprolong/* accept only `balance` and `paddle_subscription`
+     * (setPaymentCode()).
      * @return array
      */
     async balancePaymentsList() {
@@ -552,7 +934,7 @@ class ProxySellerUserApi {
     /**
      * Текущее состояние авто-пополнения баланса.
      *
-     * data (AutoTopupStateClientDto): configured, enabled, state, threshold, amount,
+     * data: configured, enabled, state, threshold, amount,
      * subscriptionId, paymentMethod {id, status, paymentMethod, brand, last4, exp},
      * failCount, lastAttemptAt, lastEvent {status, amount, at, reason}.
      *
@@ -562,8 +944,7 @@ class ProxySellerUserApi {
      * ещё не было. Лимитов dailyCountCap/monthlyAmountCap в ответе БОЛЬШЕ НЕТ — они убраны из
      * контракта 18.08.2026.
      *
-     * Если фича выключена на окружении (Property enabled_autopopup_balance), приходит
-     * ошибка code=49 "Auto top-up is not available".
+     * Если фича выключена на окружении, приходит ошибка code=49 "Auto top-up is not available".
      * @return {Promise<object>}
      */
     async balanceAutoTopupGet() {
@@ -670,8 +1051,10 @@ class ProxySellerUserApi {
      *                                                       количества — канон для mixId
      *   mix country[]            id, name                -> тот же код пакета
      *   resident tarifs[]        id, name, personal      -> id = код тарифа ("1-gb")
-     * Платёжные системы лежат отдельно, в balancePaymentsList(): там id — настоящий ObjectId,
-     * и это единственное исключение: на один код шлюза приходится несколько систем.
+     * Платёжки в справочнике нет. Заказ и продление оплачиваются только кодом `balance` (баланс)
+     * или `paddle_subscription` (привязанная карта) — setPaymentCode(). balancePaymentsList() —
+     * это системы ПОПОЛНЕНИЯ для balanceAdd(): там id — настоящий ObjectId, и это единственное
+     * исключение (на один код шлюза приходится несколько систем), а сам баланс в список не входит.
      *
      * @param string type - ipv4 | ipv6 | mobile | isp | mix | resident | null
      * @return object
@@ -781,8 +1164,8 @@ class ProxySellerUserApi {
      * @return object
      */
     /**
-     * Повторяет проверку цели из client-api v1: для ipv4/ipv6/isp заказ без цели не принимается.
-     * В v1 цель задавалась targetId+targetSectionId либо своим текстом, в v2 остался только
+     * Повторяет серверную проверку цели: для ipv4/ipv6/isp заказ без цели не принимается.
+     * В v1 цель задавалась targetId+targetSectionId либо своим текстом, в v2 — только
      * customTargetName. Для mix проверка не нужна, если передан mixId/mixCode — иначе сервер
      * резолвит тип в ipv4, и цель снова обязательна.
      *
@@ -808,7 +1191,7 @@ class ProxySellerUserApi {
     }
 
     /**
-     * Повторяет ClientApiService.parseMixSelection: сервер распознаёт mix не только по
+     * Повторяет серверный разбор mix-выбора: сервер распознаёт mix не только по
      * mixId/mixCode, но и через countryId — строкой "packageId:quantity" либо
      * countryId=packageId вместе с quantity. Если mix распознан, цель не требуется.
      * Раньше проверялись только mixId/mixCode, из-за чего mix через countryId в
@@ -890,32 +1273,6 @@ class ProxySellerUserApi {
         return { body: body, fingerprint: filled(value) ? String(value).trim() : null };
     }
 
-    /**
-     * Резидентский и скраперный заказы без X-Fingerprint не создаются вовсе: сервер отвечает
-     * "Header X-Fingerprint is required" ещё до расчёта цены. Падаем локально — как на
-     * "Set [paymentId]", — вместо заведомо отбиваемого запроса. Прочие секции заголовок
-     * игнорируют, для них отсутствие значения не ошибка.
-     * @param {object} json
-     * @param {*} fingerprint
-     * @throws ApiError
-     */
-    _assertFingerprint(json, fingerprint) {
-        if (fingerprint != null) {
-            return;
-        }
-        const section = json ? String(json.sectionCode) : '';
-        if (!FINGERPRINT_REQUIRED_SECTIONS.includes(section)) {
-            return;
-        }
-        throw new ApiError(
-            `order/make for ${section} requires the ${FINGERPRINT_HEADER} header ` +
-            '("Header X-Fingerprint is required"): pass a stable identifier of your installation ' +
-            'as new ProxySellerUserApi({ key, fingerprint }), via setFingerprint(value) or as the ' +
-            'second argument of orderMake(). The SDK never invents one — a value that changes ' +
-            'between runs breaks the anti-fraud and affiliate attribution the header exists for.'
-        );
-    }
-
     async orderCalc(json) {
         // order/calc заголовка не объявляет — fingerprint только вынимаем из тела, чтобы он
         // не уехал в payload неизвестным сервером полем.
@@ -928,17 +1285,17 @@ class ProxySellerUserApi {
      * Create an order
      * @param {*} json Free format object to send into endpoint
      * @param {string} fingerprint X-Fingerprint только для этого вызова; по умолчанию берётся
-     *        значение клиента (конструктор / setFingerprint), а также ключ fingerprint из json
+     *        ключ fingerprint из json, затем значение клиента (конструктор / setFingerprint).
+     *        Необязателен: без значения заголовок просто не уходит
      * @return object
      */
     async orderMake(json, fingerprint = null) {
         const taken = this._takeFingerprint(json, fingerprint);
         this.assertTargetName(taken.body);
-        this._assertFingerprint(taken.body, taken.fingerprint);
         return this.request('post', 'order/make', {
             data: taken.body,
-            // Заголовок шлём для ЛЮБОЙ секции: обязателен он только для резидентки и скрапера,
-            // остальные его игнорируют, а анти-фрод и атрибуция от него зависят везде.
+            // Заголовок шлём, когда значение задано, для ЛЮБОЙ секции: сервер его не требует, но
+            // анти-фрод и affiliate-атрибуция от него зависят. Без значения — не шлём и не падаем.
             ...(taken.fingerprint ? { headers: { [FINGERPRINT_HEADER]: taken.fingerprint } } : {})
         });
     }
@@ -1127,9 +1484,9 @@ class ProxySellerUserApi {
     /**
      * Create an order Resident. Attention! Deducts money from the balance.
      *
-     * Требует X-Fingerprint: без него сервер отвечает "Header X-Fingerprint is required" и
-     * пакет не создаётся. Задайте значение через setFingerprint() / конструктор либо
-     * положите его в options как fingerprint — иначе SDK падает локально.
+     * X-Fingerprint необязателен: уходит заголовком, если задан через конструктор /
+     * setFingerprint() или положен в options как fingerprint; без значения заказ уходит без
+     * заголовка.
      * @param {string|object} tarifId tariff ObjectId or its code; object = whole payload
      * @param {string} coupon
      * @param {object} options fields with no positional slot: paymentId/paymentCode, tarifCode,
@@ -1142,18 +1499,21 @@ class ProxySellerUserApi {
     /**
      * List of orders
      *
-     * Возвращает не плоский список, а пару metadata + items — форма v1, потому что ту же
-     * выдачу через обратное зеркало получают клиенты легаси-API. metadata есть всегда: без
+     * Возвращает не плоский список, а пару metadata + items. metadata есть всегда: без
      * limit там total_pages = 1, current_limit = 0, а весь список лежит в items.
      *
+     * Фильтры запроса и поля ответа здесь в snake_case (start_date, is_extend, order_id) —
+     * передавайте их ровно под этими именами.
+     *
      * id, order_id, order_number, base_order_number и items[].order_part_id — СТРОКИ; id —
-     * легаси-число битрикса либо суррогат от base_order_number, наш ObjectId лежит в order_id
-     * (тот же, что order_id в proxyList). summ и вложенные items[].price — тоже строки, уже с
-     * валютой ('$25.00'), auto_order / is_extend — 'Y'/'N', даты — ISO 8601 со смещением ('2026-09-01T14:15:26+00:00').
+     * числовой номер заказа, переданный строкой, а ObjectId заказа лежит в order_id (тот же,
+     * что order_id в proxyList(), и тот, что prolong/* и autoprolong/* принимают в orderIds).
+     * summ и вложенные items[].price — тоже строки, уже с валютой ('$25.00'),
+     * auto_order / is_extend — 'Y'/'N', даты — ISO 8601 со смещением ('2026-09-01T14:15:26+00:00').
      *
      * @param {*} filters order_id | start_date | end_date | status | is_extend | auto_order |
-     *                    page | limit | sort_by | order — все опциональны, имена snake_case,
-     *                    как в v1. status — PAYED | NOT_PAYED | RETURN (это status_type ответа,
+     *                    page | limit | sort_by | order — все опциональны.
+     *                    status — PAYED | NOT_PAYED | RETURN (это status_type ответа,
      *                    а не человекочитаемый status), is_extend / auto_order — 'Y'/'N',
      *                    sort_by — date_insert | summ | status, order — asc | desc
      * @return object
@@ -1166,128 +1526,294 @@ class ProxySellerUserApi {
     /////////////////////////////// Prolong ///////////////////////////////
 
     /**
-     * Разводит то, что пришло от вызывающего, на адреса и ObjectId.
-     *
-     * Клиенту удобнее продлевать по самим адресам — именно их он видит в proxy/list.
-     * Сервер принимает их в поле ips и сам переводит в ids
-     * (ClientApiService.resolveProlongIpsToIds — безусловно и для calc, и для make).
-     * Адрес содержит точку или двоеточие (ipv4/isp/mix "ip", ipv6 "ip" = "шлюз:порт",
-     * mobile "ip:port_http:port_socks"), ObjectId — 24 hex-символа без них, так что
-     * смешанный список тоже работает.
-     *
-     * У ipv6 поле "ip" из proxy/list уже содержит шлюз с портом ("1.2.3.4:26000"),
-     * а "ip_only" — только шлюз, так что "ip" передаётся как есть, как и для остальных типов.
-     * @param {array|string} ipsOrIds
-     * @return {{ips: string[], ids: string[]}}
+     * Приводит тип из пути к ключу, по которому сервер выбирает правила продления:
+     * trim, lower case, '-' и пробел -> '_' (' Mix-ISP ' -> 'mix_isp'). В путь запроса уходит
+     * исходное значение — нормализованное нужно только для выбора поля.
+     * @param {*} type
+     * @return {string}
      */
-    _splitProlongTargets(ipsOrIds) {
-        const ips = [];
-        const ids = [];
-        let items;
-        if (typeof ipsOrIds === 'string') {
-            items = ipsOrIds.split(',');
-        } else if (Array.isArray(ipsOrIds)) {
-            items = ipsOrIds;
-        } else {
-            return { ips, ids };
-        }
-        for (const item of items) {
-            if (typeof item !== 'string') {
-                ids.push(item);
-                continue;
-            }
-            const value = item.trim();
-            if (!value) {
-                continue;
-            }
-            (value.includes('.') || value.includes(':') ? ips : ids).push(value);
-        }
-        return { ips, ids };
+    _normalizeProlongType(type) {
+        return String(type == null ? '' : type).trim().toLowerCase().replace(/[- ]/g, '_');
     }
 
-    prepareProlong(ids, periodId, coupon, options = {}) {
-        let payload;
-        let values;
-        if (ids && typeof ids === 'object' && !Array.isArray(ids)) {
-            payload = { ...this.paymentOptions() };
-            values = { ...ids, ...options };
+    /**
+     * true, если на месте выбора пришёл объект — тогда это всё тело целиком. Массив, Set и
+     * прочие iterable — это сам выбор, а не тело.
+     * @param {*} value
+     * @return {boolean}
+     */
+    _isProlongPayload(value) {
+        return value !== null && typeof value === 'object' && !Array.isArray(value) &&
+            typeof value[Symbol.iterator] !== 'function';
+    }
+
+    /**
+     * Приводит выбор к плоскому списку: массив (или другой iterable, например Set), строка через
+     * запятую либо одиночное значение. Строки обрезаются, пустые элементы и null/undefined
+     * пропускаются, числа приводятся к строке — идентификаторы v2 всегда строки.
+     * @param {*} value
+     * @return {array}
+     */
+    _prolongList(value) {
+        let items;
+        if (value === undefined || value === null) {
+            return [];
+        } else if (typeof value === 'string') {
+            items = value.split(',');
+        } else if (typeof value === 'object' && typeof value[Symbol.iterator] === 'function') {
+            items = Array.from(value);
         } else {
-            const targets = this._splitProlongTargets(ids);
-            const routed = {};
-            if (targets.ips.length || targets.ids.length) {
-                // Пустой ids рядом с ips не ставим: сервер отдаёт приоритет ids.
-                if (targets.ids.length) routed.ids = targets.ids;
-                if (targets.ips.length) routed.ips = targets.ips;
-            } else if (ids != null) {
-                routed.ids = ids;
-            }
-            payload = { ...this.paymentOptions(), ...routed, periodId: periodId, coupon: coupon };
-            values = options && typeof options === 'object' && !Array.isArray(options) ? options : {};
+            items = [value];
         }
-        for (const key of [
-            'ids', 'ips', 'orderSeparatorIds', 'orderSeparatorId', 'coupon',
-            'periodId', 'periodCode', 'paymentId', 'paymentCode'
-        ]) {
+        const list = [];
+        for (const item of items) {
+            if (item === undefined || item === null) {
+                continue;
+            }
+            if (typeof item === 'string') {
+                const trimmed = item.trim();
+                if (trimmed) {
+                    list.push(trimmed);
+                }
+            } else if (typeof item === 'number' || typeof item === 'bigint') {
+                list.push(String(item));
+            } else {
+                list.push(item);
+            }
+        }
+        return list;
+    }
+
+    /**
+     * Раскладывает позиционный выбор prolong/* и autoprolong/* по полям тела с учётом типа.
+     *
+     * Значение с точкой или двоеточием — адрес, как его отдаёт proxy/list: поле `ip` у ipv4/isp,
+     * ip + ':' + port_http + ':' + port_socks у mobile. Адреса уходят в `ips`. Всё остальное —
+     * идентификатор, и его поле задаёт тип:
+     *   ipv4, isp, mobile   — прокси продлеваются по отдельности: это `id` прокси из proxy/list,
+     *                         уходит в `ipIds`;
+     *   ipv6, mix, mix_isp  — продаются и продлеваются только целыми заказами: это `order_id`
+     *                         из proxy/list или order/list, уходит в `orderIds`.
+     * Id прокси и id заказа — оба ObjectId, по форме их не отличить, поэтому для ipv6/mix/mix_isp
+     * передавайте именно order_id. Адрес для этих типов всё равно уходит в `ips`, и сервер
+     * отвечает "[ips] is not applicable for <type>: prolong by [orderIds]" — ошибка называет
+     * нужное поле, а не прячется за подменой.
+     *
+     * Здесь только раскладка. Что из разложенного отправлять нельзя (смесь id и адресов у
+     * ipv4/isp/mobile, любой выбор у резидентки), решает _assertProlongSelection().
+     *
+     * Пустые списки не возвращаются — поле без значений в тело не попадает.
+     * @param {string} type
+     * @param {array|string} ipsOrIds
+     * @return {{ipIds?: string[], orderIds?: string[], ips?: string[]}}
+     */
+    _splitProlongTargets(type, ipsOrIds) {
+        const kind = this._normalizeProlongType(type);
+        const ips = [];
+        const ids = [];
+        for (const item of this._prolongList(ipsOrIds)) {
+            const isAddress = typeof item === 'string' && (item.includes('.') || item.includes(':'));
+            (isAddress ? ips : ids).push(item);
+        }
+        const routed = {};
+        if (ids.length) {
+            routed[ORDER_PROLONG_TYPES.includes(kind) ? 'orderIds' : 'ipIds'] = ids;
+        }
+        if (ips.length) {
+            routed.ips = ips;
+        }
+        return routed;
+    }
+
+    /**
+     * Тело prolong/calc и prolong/make; на нём же строится тело autoprolong/*.
+     *
+     * Позиционный выбор раскладывается по полям с учётом типа — см. _splitProlongTargets().
+     * Поля из options (либо из объекта на месте выбора — тогда это всё тело целиком) уходят как
+     * переданы, поверх разложенного: ipIds, ips, orderIds, coupon, periodId/periodCode,
+     * paymentId/paymentCode. Подходит ли поле выбора типу, проверяет сервер. Пустые списки не
+     * отправляются.
+     *
+     * Локально отбиваются три случая, которые сервер обработал бы молча не так, как ждёт
+     * вызывающий:
+     *   - ids, orderSeparatorIds, orderSeparatorId — убраны из контракта, сервер их не читает
+     *     (_assertNoRemovedProlongFields, ошибка называет замену);
+     *   - ipIds вместе с ips у ipv4/isp/mobile — сервер продлевает по ipIds и игнорирует ips,
+     *     адреса выпали бы из оплаченного продления;
+     *   - любой выбор у резидентки — автопродление там применяется ко всему пакету
+     *     (оба — _assertProlongSelection).
+     * @param {string} type тип из пути: ipv4 | isp | mobile | ipv6 | mix | mix_isp | resident
+     * @param {array|string|object} ipsOrIds выбор либо объект = всё тело целиком
+     * @param {string} periodId
+     * @param {string} coupon
+     * @param {object} options
+     * @return {object}
+     * @throws ApiError в трёх случаях выше
+     */
+    prepareProlong(type, ipsOrIds, periodId, coupon, options = {}) {
+        const extra = options && typeof options === 'object' && !Array.isArray(options) ? options : {};
+        const isPayload = this._isProlongPayload(ipsOrIds);
+        const values = isPayload ? { ...ipsOrIds, ...extra } : extra;
+        this._assertNoRemovedProlongFields(values);
+        const payload = isPayload
+            ? { ...this.paymentOptions() }
+            : {
+                ...this.paymentOptions(),
+                ...this._splitProlongTargets(type, ipsOrIds),
+                periodId: periodId,
+                coupon: coupon
+            };
+        for (const key of PROLONG_BODY_FIELDS) {
             if (Object.prototype.hasOwnProperty.call(values, key)) {
                 payload[key] = values[key];
             }
         }
+        for (const key of PROLONG_SELECTION_FIELDS) {
+            const list = this._prolongList(payload[key]);
+            if (list.length) {
+                payload[key] = list;
+            } else {
+                delete payload[key];
+            }
+        }
+        this._assertProlongSelection(type, payload);
         return this.filterEmpty(this._resolveReferencePairs(payload, PROLONG_REFERENCE_PAIRS));
     }
 
     /**
-     * Calculate the renewal
-     * @param string type - ipv4 | ipv6 | mobile | isp | mix
-     * @param {array|string} ipsOrIds the addresses themselves, exactly as proxy/list returns them:
-     *   the 'ip' field ('1.2.3.4') for ipv4/isp/mix/mix_isp, the 'ip' field for ipv6 too
-     *   (it already carries the gateway with the port, '1.2.3.4:26000', while 'ip_only' holds
-     *   the bare gateway), and ip + ':' + port_http + ':' + port_socks for mobile.
-     *   ObjectId strings are accepted too, and a mixed array works — each value is routed by shape.
-     *   An object here is treated as the whole payload instead.
+     * ids, orderSeparatorIds и orderSeparatorId убраны из контракта: сервер их больше не читает.
+     * Молча выбросить их нельзя — вызов ушёл бы без того выбора, который задумывал вызывающий, —
+     * поэтому переданное поле (даже пустое) отбивается с именем замены. Та же логика, что у
+     * удалённых полей balance/autotopup/set.
+     * @param {object} values options либо объектная форма вызова
+     * @throws ApiError
+     */
+    _assertNoRemovedProlongFields(values) {
+        const has = (key) => Object.prototype.hasOwnProperty.call(values, key);
+        const problems = [];
+        if (has('ids')) {
+            problems.push('`ids` was removed: use `ipIds` (ipv4/isp/mobile) or `orderIds` (ipv6/mix/mix_isp)');
+        }
+        if (has('orderSeparatorIds') || has('orderSeparatorId')) {
+            problems.push('`orderSeparatorIds`/`orderSeparatorId` were removed: use `orderIds`');
+        }
+        if (problems.length > 0) {
+            throw new ApiError(problems.join('; '));
+        }
+    }
+
+    /**
+     * Проверяет уже разложенный выбор (в payload остались только непустые ipIds/ips/orderIds).
+     *
+     * Резидентка: автопродление применяется ко всему пакету, и любой выбор — ошибка. Выбросить его
+     * молча нельзя: disable, адресованный паре адресов, выключил бы автопродление всего пакета.
+     *
+     * ipv4/isp/mobile: ipIds вместе с ips не отправляем — сервер продлевает по ipIds и игнорирует
+     * ips, так что адреса молча выпали бы из оплаченного продления. У ipv6/mix/mix_isp смесь
+     * допустима: id уходят в orderIds, а адреса в ips сервер отбивает сам, называя поле.
+     * @param {string} type
+     * @param {object} payload
+     * @throws ApiError
+     */
+    _assertProlongSelection(type, payload) {
+        const kind = this._normalizeProlongType(type);
+        if (RESIDENT_PROLONG_TYPES.includes(kind)) {
+            if (PROLONG_SELECTION_FIELDS.some((key) => payload[key] !== undefined)) {
+                throw new ApiError(
+                    'resident auto-prolong applies to the whole package: do not pass proxy or order ids ' +
+                    '(pass null as the selection and no ipIds / ips / orderIds in options)'
+                );
+            }
+            return;
+        }
+        if (!ORDER_PROLONG_TYPES.includes(kind) && payload.ipIds !== undefined && payload.ips !== undefined) {
+            throw new ApiError(
+                'Mixing proxy ids and addresses in one call is not supported: pass either ids or ' +
+                `addresses. For ${kind || 'this type'} the server renews by ipIds and ignores ips when ` +
+                'both are sent, so the addresses would silently drop out of the renewal.'
+            );
+        }
+    }
+
+    /**
+     * Calculate the renewal. Nothing is charged.
+     *
+     * What is renewed depends on the type:
+     *   ipv4, isp, mobile   — individual proxies. Pass the addresses exactly as proxy/list
+     *                         returns them — the 'ip' field ('1.2.3.4') for ipv4/isp,
+     *                         ip + ':' + port_http + ':' + port_socks for mobile — or the proxy
+     *                         'id'. Addresses are sent as ips, proxy ids as ipIds.
+     *   ipv6, mix, mix_isp  — whole orders only. Pass the 'order_id' from proxy/list or
+     *                         order/list: it is sent as orderIds, and every active proxy of that
+     *                         type in those orders is renewed (for mix/mix_isp — the mix packages
+     *                         of those orders). ipv6 is no longer renewed by 'host:port'.
+     * Each value is routed by its shape — a '.' or ':' makes it an address. For ipv4/isp/mobile
+     * pass either ids or addresses in one call, not both: the server renews by ipIds and ignores
+     * ips when both are sent, so the SDK throws instead of letting the addresses drop out of the
+     * renewal. A proxy id and an order id look alike, so for ipv6/mix/mix_isp a proxy id lands in
+     * orderIds and the server answers "Incorrect orderIds" (code 29); an address lands in ips and
+     * the server answers "[ips] is not applicable for <type>: prolong by [orderIds]".
+     *
+     * @param string type - ipv4 | isp | mobile | ipv6 | mix | mix_isp
+     * @param {array|string|object} ipsOrIds addresses / ids as described above: an array (or a
+     *   Set), a comma-separated string or a single value. An object here is treated as the whole
+     *   payload instead.
      * @param {string} periodId ObjectId or period code (e.g. '1m') — prolong runs the same fallback
      * @param string coupon
-     * @param {object} options fields with no positional slot: orderSeparatorIds, paymentId/paymentCode
+     * @param {object} options fields with no positional slot: ipIds / ips / orderIds (sent as
+     *   given, on top of the routed values), periodCode, paymentId/paymentCode.
+     *   ids, orderSeparatorIds and orderSeparatorId were removed from the contract: passing
+     *   them throws an ApiError that names the replacement.
      * @return object
+     * @throws ApiError locally for a removed field, or for ipIds together with ips on
+     *   ipv4/isp/mobile
      */
     async prolongCalc(type, ipsOrIds, periodId = null, coupon = '', options = {}) {
         return this.request('post', 'prolong/calc/' + this._pathSegment(type), {
-            data: this.prepareProlong(ipsOrIds, periodId, coupon, options)
+            data: this.prepareProlong(type, ipsOrIds, periodId, coupon, options)
         });
     }
 
     /**
      * Create a renewal order. Attention! Deducts money from the balance.
-     * @param string type - ipv4 | ipv6 | mobile | isp | mix
-     * @param {array|string} ipsOrIds the addresses themselves, exactly as proxy/list returns them:
-     *   the 'ip' field ('1.2.3.4') for ipv4/isp/mix/mix_isp, the 'ip' field for ipv6 too
-     *   (it already carries the gateway with the port, '1.2.3.4:26000', while 'ip_only' holds
-     *   the bare gateway), and ip + ':' + port_http + ':' + port_socks for mobile.
-     *   ObjectId strings are accepted too, and a mixed array works — each value is routed by shape.
-     *   An object here is treated as the whole payload instead.
+     *
+     * The selection works exactly as in prolongCalc(): addresses or proxy ids for ipv4/isp/mobile,
+     * order ids ('order_id') for ipv6/mix/mix_isp, which are renewed only as whole orders.
+     * @param string type - ipv4 | isp | mobile | ipv6 | mix | mix_isp
+     * @param {array|string|object} ipsOrIds see prolongCalc(); an object is the whole payload
      * @param {string} periodId ObjectId or period code (e.g. '1m') — prolong runs the same fallback
      * @param string coupon
-     * @return object {orderId, total, balance, listBaseOrderNumbers}
+     * @param {object} options fields with no positional slot: ipIds / ips / orderIds, periodCode,
+     *   paymentId/paymentCode
+     * @return object {orderId, orderIds, total, listBaseOrderNumbers, balance}: orderIds lists
+     *         every renewed order (one request can renew several), orderId is orderIds[0];
+     *         listBaseOrderNumbers holds one base order number per renewed order (per mix
+     *         package for mix/mix_isp)
      * @throws ApiError при нехватке средств: продление НЕ состоялось, причина приходит как
      *         code 16 "Insufficient funds on balance", а расчёт с warning/balance/total
-     *         остаётся доступен в error.body.data
+     *         остаётся доступен в error.body.data. Локально, до запроса — в тех же случаях,
+     *         что у prolongCalc(): удалённое поле или ipIds вместе с ips у ipv4/isp/mobile
      */
     async prolongMake(type, ipsOrIds, periodId = null, coupon = '', options = {}) {
-        // Отдельная пост-проверка результата больше не нужна: нехватку средств сервер кладёт
-        // в errors[{code:16}] (ProlongMakeResponseClientDto.ofInsufficientFunds), и общий
-        // разбор конверта в request() бросает ApiError сам, сохранив calc-данные в error.body.
-        // Прежняя обёртка писалась под форму "status:error + ПУСТОЙ errors[]" и после правки
-        // сервера умела только одно: превращать легитимный success с пустым orderId в
-        // фальшивую ошибку, теряя total/balance/listBaseOrderNumbers уже ПОСЛЕ списания денег.
+        // Отдельная пост-проверка результата не нужна: нехватку средств сервер кладёт в
+        // errors[{code:16}], оставляя расчёт в data, и общий разбор конверта в request()
+        // бросает ApiError сам, сохранив calc-данные в error.body. Прежняя обёртка писалась под
+        // форму "status:error + ПУСТОЙ errors[]" и после правки сервера умела только одно:
+        // превращать легитимный success с пустым orderId в фальшивую ошибку, теряя
+        // total/balance/listBaseOrderNumbers уже ПОСЛЕ списания денег.
         return this.request('post', 'prolong/make/' + this._pathSegment(type), {
-            data: this.prepareProlong(ipsOrIds, periodId, coupon, options)
+            data: this.prepareProlong(type, ipsOrIds, periodId, coupon, options)
         });
     }
 
     /////////////////////////////// Autoprolong ///////////////////////////////
 
     /**
-     * Тело autoprolong/*: то же, что у prolong/* (ids/ips/orderSeparatorIds,
-     * periodId/periodCode, paymentId/paymentCode), плюс subscriptionId и tarifId.
+     * Тело autoprolong/*: тот же выбор, что у prolong/* (ipIds / ips для ipv4, isp, mobile;
+     * orderIds для ipv6, mix, mix_isp; у резидентки — никакого), те же periodId/periodCode и
+     * paymentId/paymentCode, плюс subscriptionId и tarifId. Те же и локальные отказы (см.
+     * prepareProlong): удалённые ids / orderSeparatorIds / orderSeparatorId, ipIds вместе с ips
+     * у ipv4/isp/mobile и любой выбор у резидентки.
      *
      * Купона здесь нет специально: автопродление промокоды НЕ применяет нигде, и сервер
      * сознательно не передаёт coupon в расчёт — иначе превью показывало бы цену со скидкой,
@@ -1296,19 +1822,21 @@ class ProxySellerUserApi {
      * Snake-алиасы (payment_id, subscription_id, tarif_id, tariffId) на входе принимаются, но в
      * тело уходит каноническое camelCase-написание: на сервере camelCase старше snake_case, и
      * отправлять оба сразу незачем.
-     * @param {array|string|object} ipsOrIds адреса/ObjectId, либо объект = всё тело целиком
+     * @param {string} type тип из пути — от него зависит, в какое поле уйдёт выбор
+     * @param {array|string|object} ipsOrIds выбор, как у prolongCalc(), либо объект = всё тело
      * @param {string} periodId ObjectId or period code (e.g. '1m')
-     * @param {object} options subscriptionId, tarifId, orderSeparatorIds, paymentId/paymentCode
+     * @param {object} options subscriptionId, tarifId, ipIds / ips / orderIds, paymentId/paymentCode
      * @return {object}
+     * @throws ApiError в случаях, перечисленных выше
      */
-    prepareAutoProlong(ipsOrIds, periodId, options = {}) {
-        const isPayload = ipsOrIds && typeof ipsOrIds === 'object' && !Array.isArray(ipsOrIds);
+    prepareAutoProlong(type, ipsOrIds, periodId, options = {}) {
+        const isPayload = this._isProlongPayload(ipsOrIds);
         const extra = options && typeof options === 'object' && !Array.isArray(options)
             ? options
             : {};
         const values = this._normalizeAutoProlongAliases(isPayload ? { ...ipsOrIds, ...extra } : extra);
         // Купон явно null: у prepareProlong он позиционный, а автопродлению не нужен.
-        const payload = this.prepareProlong(isPayload ? values : ipsOrIds, periodId, null, values);
+        const payload = this.prepareProlong(type, isPayload ? values : ipsOrIds, periodId, null, values);
         for (const key of ['subscriptionId', 'tarifId']) {
             if (Object.prototype.hasOwnProperty.call(values, key)) {
                 payload[key] = values[key];
@@ -1319,7 +1847,7 @@ class ProxySellerUserApi {
 
     /**
      * Приводит snake-алиасы к каноническому написанию. Если рядом уже лежит camelCase-ключ,
-     * алиас отбрасывается — тот же приоритет, что у AutoProlongRequestClientDto.applyAliases.
+     * алиас отбрасывается — тот же приоритет, что у сервера: camelCase старше snake_case.
      * @param {object} values
      * @return {object}
      */
@@ -1338,14 +1866,14 @@ class ProxySellerUserApi {
     /**
      * Скрапер автопродления не имеет: трафик к нему докупается новым заказом, и сервер отвечает
      * "Create new order to add traffic, prolong options not available" — проверка стоит ДО
-     * резолва типа, так что запрос отбивается целиком. Резидентка сюда НЕ попадает: её
-     * autoprolong обслуживает ClientApiAutoProlongRouter, там тип поддержан.
+     * резолва типа, так что запрос отбивается целиком. Резидентки это не касается: для неё
+     * autoprolong/* поддержан (type='resident'), единица правки там — пакет.
      * @param {*} type
      * @param {string} action
      * @throws ApiError
      */
     _assertAutoProlongType(type, action) {
-        if (String(type == null ? '' : type).trim().toLowerCase() !== 'scraper') {
+        if (this._normalizeProlongType(type) !== 'scraper') {
             return;
         }
         throw new ApiError(
@@ -1391,18 +1919,24 @@ class ProxySellerUserApi {
      *
      * Нехватка баланса — НЕ исключение: приходит status="error" с ЗАПОЛНЕННЫМ data и ПУСТЫМ
      * errors[] (та же форма, что у prolong/calc), и метод вернёт расчёт с текстом в warning.
-     * @param string type - ipv4 | ipv6 | mobile | isp | mix | mix_isp | resident
-     * @param {array|string|object} ipsOrIds адреса/ObjectId; для type='resident' не нужны —
-     *        единица правки там ПАКЕТ, тело состоит из paymentId и необязательного tarifId
+     *
+     * Выбор — как у prolongCalc(): адреса или `id` прокси для ipv4/isp/mobile, `order_id` заказов
+     * для ipv6/mix/mix_isp — они автопродлеваются только целым заказом, и quantity/items
+     * покрывают все активные прокси этих заказов.
+     * @param string type - ipv4 | isp | mobile | ipv6 | mix | mix_isp | resident
+     * @param {array|string|object} ipsOrIds выбор, как описано выше; для type='resident' — null:
+     *        единица правки там ПАКЕТ, тело состоит из paymentId и необязательного tarifId, а
+     *        любой непустой выбор (список, ipIds, ips, orderIds) — локальная ApiError
      * @param {string} periodId ObjectId or period code (e.g. '1m'); резидентке не нужен —
      *        период берётся из её тарифа
-     * @param {object} options subscriptionId, tarifId, orderSeparatorIds, paymentId/paymentCode
+     * @param {object} options subscriptionId, tarifId, ipIds / ips / orderIds, paymentId/paymentCode
      * @return object
-     * @throws ApiError при type='scraper' и без платёжки
+     * @throws ApiError при type='scraper', без платёжки, при выборе у резидентки, при ipIds вместе
+     *         с ips у ipv4/isp/mobile и при удалённых ids / orderSeparatorIds / orderSeparatorId
      */
     async autoProlongCalc(type, ipsOrIds = null, periodId = null, options = {}) {
         this._assertAutoProlongType(type, 'calc');
-        const payload = this.prepareAutoProlong(ipsOrIds, periodId, options);
+        const payload = this.prepareAutoProlong(type, ipsOrIds, periodId, options);
         this._assertAutoProlongPayment(payload, 'calc');
         return this.request('post', 'autoprolong/calc/' + this._pathSegment(type), { data: payload });
     }
@@ -1411,42 +1945,54 @@ class ProxySellerUserApi {
      * Enable automatic extension for proxies. Сейчас ничего не списывается — платёжка и период
      * лишь привязываются к выбранным прокси.
      *
-     * data: autoProlong, quantity, ids[], days, paymentId, chargeDate, dateEnd.
-     * quantity/ids — то, что РЕАЛЬНО затронуто, а не эхо запроса: у ipv6 автопродление
-     * включается целым заказом, так что один адрес включает их все. У резидентки приходит
-     * quantity=1 и пустой ids — единица правки там пакет.
-     * @param string type - ipv4 | ipv6 | mobile | isp | mix | mix_isp | resident
-     * @param {array|string|object} ipsOrIds адреса/ObjectId; для type='resident' не нужны
+     * data: warning, autoProlong, quantity, ipIds[], orderIds[], days, paymentId, chargeDate,
+     * dateEnd. quantity/ipIds — прокси, которые РЕАЛЬНО затронуты, а не эхо запроса: у ipv6, mix
+     * и mix_isp автопродление включается целым заказом, так что в ipIds попадают все активные
+     * прокси присланных заказов; orderIds — заказы затронутых прокси, без повторов. У резидентки
+     * приходит quantity=1 и пустые ipIds/orderIds — единица правки там пакет. (Раньше список
+     * затронутых прокси назывался ids.)
+     *
+     * warning заполнен, если баланса на предстоящее списание не хватит, — та же формулировка,
+     * что у autoProlongCalc(). Включение при этом состоялось: деньги нужны к chargeDate, не сейчас.
+     * @param string type - ipv4 | isp | mobile | ipv6 | mix | mix_isp | resident
+     * @param {array|string|object} ipsOrIds выбор, как у autoProlongCalc(); для type='resident' —
+     *        null (любой непустой выбор — локальная ApiError)
      * @param {string} periodId ObjectId or period code (e.g. '1m'); резидентке не нужен
      * @param {object} options subscriptionId (обязателен для paddle_subscription), tarifId,
-     *        orderSeparatorIds, paymentId/paymentCode
+     *        ipIds / ips / orderIds, paymentId/paymentCode
      * @return object
-     * @throws ApiError при type='scraper' и без платёжки
+     * @throws ApiError при type='scraper', без платёжки и в тех же случаях выбора, что у
+     *         autoProlongCalc()
      */
     async autoProlongEnable(type, ipsOrIds = null, periodId = null, options = {}) {
         this._assertAutoProlongType(type, 'enable');
-        const payload = this.prepareAutoProlong(ipsOrIds, periodId, options);
+        const payload = this.prepareAutoProlong(type, ipsOrIds, periodId, options);
         this._assertAutoProlongPayment(payload, 'enable');
         return this.request('post', 'autoprolong/enable/' + this._pathSegment(type), { data: payload });
     }
 
     /**
      * Disable automatic extension for proxies. Сбрасывает и период, и платёжку, поэтому
-     * ни periodId, ни paymentId здесь не нужны — только выбор прокси. Для type='resident'
-     * тело не нужно вовсе: пакет адресуется по apiKey.
+     * ни periodId, ни paymentId здесь не нужны — только выбор (как у autoProlongCalc()).
+     * Для type='resident' тело не нужно вовсе: пакет адресуется по apiKey, и выбор здесь особенно
+     * опасен — disable, адресованный паре адресов, выключил бы автопродление всего пакета, поэтому
+     * он отбивается локально.
      *
-     * В ответе days/paymentId/chargeDate приходят null, а dateEnd остаётся — прокси не
-     * исчезает, он просто перестаёт продлеваться сам.
-     * @param string type - ipv4 | ipv6 | mobile | isp | mix | mix_isp | resident
-     * @param {array|string|object} ipsOrIds адреса/ObjectId; для type='resident' не нужны
-     * @param {object} options orderSeparatorIds и прочие поля тела
+     * data — та же форма, что у autoProlongEnable(): ipIds[] затронутых прокси и orderIds[] их
+     * заказов (у ipv6, mix и mix_isp — все активные прокси присланных заказов). days/paymentId/
+     * chargeDate приходят null (у резидентки days остаётся — это срок её тарифа), а dateEnd
+     * остаётся — прокси не исчезает, он просто перестаёт продлеваться сам.
+     * @param string type - ipv4 | isp | mobile | ipv6 | mix | mix_isp | resident
+     * @param {array|string|object} ipsOrIds выбор, как у autoProlongCalc(); для type='resident' —
+     *        null (любой непустой выбор — локальная ApiError)
+     * @param {object} options ipIds / ips / orderIds и прочие поля тела
      * @return object
-     * @throws ApiError при type='scraper'
+     * @throws ApiError при type='scraper' и в тех же случаях выбора, что у autoProlongCalc()
      */
     async autoProlongDisable(type, ipsOrIds = null, options = {}) {
         this._assertAutoProlongType(type, 'disable');
         return this.request('post', 'autoprolong/disable/' + this._pathSegment(type), {
-            data: this.prepareAutoProlong(ipsOrIds, null, options)
+            data: this.prepareAutoProlong(type, ipsOrIds, null, options)
         });
     }
 
@@ -1474,11 +2020,10 @@ class ProxySellerUserApi {
      * @param string listId - только для резидентских выгрузок; не задан — отдаются IP всех листов
      * @param {*} filters country | ends | package_key
      *        package_key работает ТОЛЬКО на type='subresident'. Литеральный маршрут
-     *        /proxy/download/resident обслуживается ResidentUserController.downloadProxyList,
-     *        который знает лишь listId|id|ext|maxLine, а package_key молча игнорирует и отдаёт
-     *        выгрузку РОДИТЕЛЬСКОГО пакета. По той же причине при type='resident' молча
-     *        выбрасываются proto, country и ends — для резидентки берите
-     *        proxyDownloadResident(), у неё есть maxLine.
+     *        /proxy/download/resident знает лишь listId|id|ext|maxLine, а package_key молча
+     *        игнорирует и отдаёт выгрузку РОДИТЕЛЬСКОГО пакета. По той же причине при
+     *        type='resident' молча выбрасываются proto, country и ends — для резидентки
+     *        берите proxyDownloadResident(), у неё есть maxLine.
      * @return string
      * @throws ApiError при package_key вместе с type='resident'
      */
@@ -1501,7 +2046,7 @@ class ProxySellerUserApi {
     /**
      * Export the resident proxy list. Отдаётся файлом (attachment).
      * @param string id list id (числовой id резидентского листа, не ObjectId). Уходит как
-     *        query-параметр `id` — контроллер принимает его как алиас к `listId`
+     *        query-параметр `id` — сервер принимает его как алиас к `listId`
      * @param string ext - txt | csv
      * @param integer maxLine
      * @return string
@@ -1532,9 +2077,9 @@ class ProxySellerUserApi {
     }
 
     /**
-     * Локально повторяет валидацию ClientApiService.replaceProxies: сначала enum причины
+     * Локально повторяет серверную валидацию proxy/replace: сначала enum причины
      * (иначе сервер отвечает "Set coorect type: ..." с code 0), затем непустой comment для
-     * CUSTOM. Регистр сервер не важен (valueOf(value.toUpperCase())), поэтому нормализуем
+     * CUSTOM. Регистр серверу не важен (значение приводится к upper case), поэтому нормализуем
      * значение сами и отправляем канонический upper case.
      * @param {*} type
      * @param {*} comment
@@ -1599,8 +2144,8 @@ class ProxySellerUserApi {
      * Detailed traffic statistics of the resident package.
      *
      * Ключ пакета здесь называется `packageKey` (или алиас `key`), НЕ `package_key` —
-     * ResidentUserApiService.getTrafficDetails читает именно их и без него отвечает
-     * "key is required". Остальные фильтры: login, date_start, date_end.
+     * сервер читает именно их и без ключа отвечает "key is required".
+     * Остальные фильтры: login, date_start, date_end.
      * @param {{packageKey?: string, key?: string, login?: string, date_start?: string, date_end?: string}} filter
      * @return object
      */
@@ -1612,7 +2157,7 @@ class ProxySellerUserApi {
      * Database geo locations: страны -> регионы -> города -> ISP.
      *
      * Отдаётся ФАЙЛОМ geo.json — attachment с Content-Type: application/json, это НЕ zip
-     * (downloadGeoFile сериализует geo-структуру в pretty-printed JSON). Метод возвращает
+     * (внутри — geo-структура в pretty-printed JSON). Метод возвращает
      * сырые байты (Buffer/ArrayBuffer); чтобы получить объект — JSON.parse над содержимым.
      * @return binary
      */
@@ -1649,7 +2194,7 @@ class ProxySellerUserApi {
     /**
      * Create list in package.
      *
-     * geo целиком опционален: validateCreateListGeo выходит сразу, если ни country, ни region,
+     * geo целиком опционален: сервер пропускает проверку geo, если ни country, ни region,
      * ни city, ни isp не заданы. Но части geo связаны сверху вниз — region требует country,
      * city требует region, isp требует city.
      * @param string title
@@ -1792,7 +2337,7 @@ class ProxySellerUserApi {
     /**
      * Create a list inside a subpackage.
      *
-     * package_key обязателен (checkSubPackageListLimit падает с "packageKey is empty").
+     * package_key обязателен (без него сервер отвечает "packageKey is empty").
      * geo — опционален, но связан сверху вниз: region требует country ("Need [countryCode]"),
      * city требует region+country, isp требует city+region+country.
      * @return object
