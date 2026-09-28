@@ -491,11 +491,11 @@ await check('fingerprint: order/calc заголовок не шлёт и пол�
 
 /////////////////////////////// prolong: выбор зависит от типа ///////////////////////////////
 
-// ipv4 / isp / mobile продлеваются по отдельным прокси: адрес -> ips, id прокси -> ipIds.
-// ipv6 / mix / mix_isp — только целыми заказами: order_id -> orderIds. ids, orderSeparatorIds и
+// ipv4 / isp / mobile продлеваются по отдельным прокси: адрес -> ips, id прокси -> ids.
+// ipv6 / mix / mix_isp — только целыми заказами: order_id -> orderIds. orderSeparatorIds и
 // orderSeparatorId сервер больше не читает — SDK не шлёт их ни при каком вызове, а переданные
-// отбивает локально с именем замены.
-const REMOVED_PROLONG_FIELDS = ['ids', 'orderSeparatorIds', 'orderSeparatorId'];
+// отбивает локально с именем замены (orderIds).
+const REMOVED_PROLONG_FIELDS = ['orderSeparatorIds', 'orderSeparatorId'];
 
 function assertNoRemovedFields(payload) {
     for (const field of REMOVED_PROLONG_FIELDS) {
@@ -505,21 +505,20 @@ function assertNoRemovedFields(payload) {
 
 const prolongClient = new ProxySellerUserApi({ key: 'k' });
 
-await check('prolong ipv4: адреса уезжают в ips, пустого ipIds рядом нет', () => {
+// Тела сверяются целиком (assertBody): так в них не пролезет ни одно поле сверх контракта.
+await check('prolong ipv4: адреса уезжают в ips, пустого ids рядом нет', () => {
     const payload = prolongClient.prepareProlong('ipv4', ['1.2.3.4', '5.6.7.8'], '1m', '');
-    assertEqual(payload.ips, ['1.2.3.4', '5.6.7.8'], 'ips lost');
-    assert(!('ipIds' in payload), `ipIds must be absent, got ${JSON.stringify(payload)}`);
+    assertBody(payload, { ips: ['1.2.3.4', '5.6.7.8'], periodId: '1m', coupon: '' }, 'ipv4 by address');
     assertNoRemovedFields(payload);
 });
 
-await check('prolong ipv4: id прокси уезжает в ipIds, а не в ids/orderIds', () => {
+await check('prolong ipv4: id прокси уезжает в ids, а не в orderIds', () => {
     const payload = prolongClient.prepareProlong('ipv4', [PROXY_ID], '1m', '');
-    assertEqual(payload.ipIds, [PROXY_ID], 'ipIds lost');
-    assert(!('ips' in payload) && !('orderIds' in payload), `unexpected fields: ${JSON.stringify(payload)}`);
+    assertBody(payload, { ids: [PROXY_ID], periodId: '1m', coupon: '' }, 'ipv4 by id');
     assertNoRemovedFields(payload);
 });
 
-// Сервер продлевает по ipIds и игнорирует ips, когда пришли оба: адреса молча выпали бы из
+// Сервер продлевает по ids и игнорирует ips, когда пришли оба: адреса молча выпали бы из
 // оплаченного продления. Поэтому смесь id и адресов у ipv4/isp/mobile — локальная ошибка,
 // откуда бы ни пришли обе половины: из позиционного списка, из options или из объекта.
 await check('prolong ipv4/isp/mobile: смесь id и адресов отбивается локально', async () => {
@@ -528,10 +527,10 @@ await check('prolong ipv4/isp/mobile: смесь id и адресов отбив
             'Mixing proxy ids and addresses in one call is not supported');
     }
     await expectApiError(
-        () => prolongClient.prepareProlong('ipv4', ['1.2.3.4'], '1m', '', { ipIds: [PROXY_ID] }),
-        'pass either ids or addresses');
+        () => prolongClient.prepareProlong('ipv4', ['1.2.3.4'], '1m', '', { ids: [PROXY_ID] }),
+        'the server renews by ids and ignores ips');
     await expectApiError(
-        () => prolongClient.prepareProlong('mobile', { ipIds: [PROXY_ID], ips: ['10.0.0.1:8000:9000'] }),
+        () => prolongClient.prepareProlong('mobile', { ids: [PROXY_ID], ips: ['10.0.0.1:8000:9000'] }),
         'pass either ids or addresses');
 });
 
@@ -544,23 +543,19 @@ await check('prolong ipv4/isp/mobile: смесь не уходит в сеть �
     assertEqual(calls.length, 0, 'no request may be sent');
 });
 
-await check('prolong isp/mobile: как ipv4 — id в ipIds, mobile-тройка в ips', () => {
+await check('prolong isp/mobile: как ipv4 — id в ids, mobile-тройка в ips', () => {
     for (const type of ['isp', 'mobile']) {
         const byId = prolongClient.prepareProlong(type, [PROXY_ID], '1m', '');
-        assertEqual(byId.ipIds, [PROXY_ID], `${type}: ipIds lost`);
-        assert(!('ips' in byId) && !('orderIds' in byId), `${type}: unexpected fields ${JSON.stringify(byId)}`);
+        assertBody(byId, { ids: [PROXY_ID], periodId: '1m', coupon: '' }, `${type}: by id`);
     }
     const byAddress = prolongClient.prepareProlong('mobile', ['10.0.0.1:8000:9000'], '1m', '');
-    assertEqual(byAddress.ips, ['10.0.0.1:8000:9000'], 'mobile: ips lost');
-    assert(!('ipIds' in byAddress), `mobile: ipIds must be absent, got ${JSON.stringify(byAddress)}`);
+    assertBody(byAddress, { ips: ['10.0.0.1:8000:9000'], periodId: '1m', coupon: '' }, 'mobile: by address');
 });
 
-await check('prolong ipv6/mix/mix_isp: order_id уезжает в orderIds, а не в ipIds', () => {
+await check('prolong ipv6/mix/mix_isp: order_id уезжает в orderIds, а не в ids', () => {
     for (const type of ['ipv6', 'mix', 'mix_isp']) {
         const payload = prolongClient.prepareProlong(type, [ORDER_ID], '1m', '');
-        assertEqual(payload.orderIds, [ORDER_ID], `${type}: orderIds lost`);
-        assert(!('ipIds' in payload) && !('ips' in payload),
-            `${type}: unexpected fields ${JSON.stringify(payload)}`);
+        assertBody(payload, { orderIds: [ORDER_ID], periodId: '1m', coupon: '' }, `${type}: by order`);
         assertNoRemovedFields(payload);
     }
 });
@@ -571,9 +566,8 @@ await check('prolong ipv6/mix/mix_isp: order_id уезжает в orderIds, а �
 await check('prolong ipv6/mix/mix_isp: адрес уезжает в ips, order_id — в orderIds', () => {
     for (const type of ['ipv6', 'mix', 'mix_isp']) {
         const payload = prolongClient.prepareProlong(type, ['1.2.3.4:26000', ORDER_ID], '1m', '');
-        assertEqual(payload.ips, ['1.2.3.4:26000'], `${type}: ips lost`);
-        assertEqual(payload.orderIds, [ORDER_ID], `${type}: orderIds lost`);
-        assert(!('ipIds' in payload), `${type}: ipIds must be absent`);
+        assertBody(payload, { ips: ['1.2.3.4:26000'], orderIds: [ORDER_ID], periodId: '1m', coupon: '' },
+            `${type}: address and order`);
     }
 });
 
@@ -582,8 +576,8 @@ await check('prolong: тип нормализуется, как на серве�
         const payload = prolongClient.prepareProlong(type, [ORDER_ID], '1m', '');
         assertEqual(payload.orderIds, [ORDER_ID], `"${type}" must route to orderIds`);
     }
-    assertEqual(prolongClient.prepareProlong(' ISP ', [PROXY_ID], '1m', '').ipIds, [PROXY_ID],
-        '" ISP " must route to ipIds');
+    assertEqual(prolongClient.prepareProlong(' ISP ', [PROXY_ID], '1m', '').ids, [PROXY_ID],
+        '" ISP " must route to ids');
 });
 
 await check('prolong: строка через запятую, Set и пустые элементы', () => {
@@ -591,7 +585,7 @@ await check('prolong: строка через запятую, Set и пусты�
         ['1.2.3.4', '5.6.7.8'], 'comma-separated string lost');
     assertEqual(prolongClient.prepareProlong('mix_isp', new Set([ORDER_ID]), '1m', '').orderIds,
         [ORDER_ID], 'Set lost');
-    assertEqual(prolongClient.prepareProlong('ipv4', [' ', null, PROXY_ID], '1m', '').ipIds,
+    assertEqual(prolongClient.prepareProlong('ipv4', [' ', null, PROXY_ID], '1m', '').ids,
         [PROXY_ID], 'blank and null items must be skipped');
 });
 
@@ -599,7 +593,7 @@ await check('prolong: пустой выбор — в теле нет ни одн
     for (const selection of [[], '', ' , ', null, undefined]) {
         for (const type of ['ipv4', 'ipv6']) {
             const payload = prolongClient.prepareProlong(type, selection, '1m', '');
-            for (const field of ['ipIds', 'ips', 'orderIds', ...REMOVED_PROLONG_FIELDS]) {
+            for (const field of ['ids', 'ips', 'orderIds', ...REMOVED_PROLONG_FIELDS]) {
                 assert(!(field in payload),
                     `${type} ${JSON.stringify(selection)}: ${field} must be absent, got ${JSON.stringify(payload)}`);
             }
@@ -607,50 +601,57 @@ await check('prolong: пустой выбор — в теле нет ни одн
     }
 });
 
-// Удалённые поля не выбрасываются молча, а отбиваются с именем замены — как dailyCountCap у
-// balance/autotopup/set. Отбивается само наличие ключа, даже с пустым значением.
-await check('prolong: ids из options — локальная ошибка с заменой', async () => {
-    for (const type of ['ipv4', 'ipv6']) {
-        await expectApiError(() => prolongClient.prepareProlong(type, [PROXY_ID], '1m', '', { ids: [PROXY_ID] }),
-            '`ids` was removed: use `ipIds` (ipv4/isp/mobile) or `orderIds` (ipv6/mix/mix_isp)');
-    }
-    await expectApiError(() => prolongClient.prepareProlong('ipv4', null, '1m', '', { ids: [] }), '`ids` was removed');
+// ids — рабочее поле выбора ipv4/isp/mobile, а не удалённое: ни в options, ни в объектной форме
+// оно не отбивается. Подходит ли поле типу, решает сервер ("[ids] is not applicable for ipv6:
+// prolong by [orderIds]"), поэтому явно переданное ids уходит как есть и в orderIds не подменяется.
+await check('prolong: ids из options и объектной формы — рабочее поле, уходит как передано', () => {
+    assertBody(prolongClient.prepareProlong('ipv4', null, '1m', '', { ids: [PROXY_ID] }),
+        { ids: [PROXY_ID], periodId: '1m', coupon: '' }, 'ipv4: ids from options');
+    assertBody(prolongClient.prepareProlong('isp', { ids: PROXY_ID, periodId: '1m' }),
+        { ids: [PROXY_ID], periodId: '1m' }, 'isp: ids in the object form');
+    assertBody(prolongClient.prepareProlong('ipv6', null, '1m', '', { ids: [PROXY_ID] }),
+        { ids: [PROXY_ID], periodId: '1m', coupon: '' }, 'ipv6: explicit ids must go out as given');
 });
 
+// Удалённые поля не выбрасываются молча, а отбиваются с именем замены — как dailyCountCap у
+// balance/autotopup/set. Отбивается само наличие ключа, даже с пустым значением.
 await check('prolong: orderSeparatorIds/orderSeparatorId — локальная ошибка с заменой', async () => {
     for (const field of ['orderSeparatorIds', 'orderSeparatorId']) {
         await expectApiError(() => prolongClient.prepareProlong('mix', [ORDER_ID], '1m', '', { [field]: 'SEP' }),
+            '`orderSeparatorIds`/`orderSeparatorId` were removed: use `orderIds`');
+        await expectApiError(() => prolongClient.prepareProlong('ipv4', [PROXY_ID], '1m', '', { [field]: [] }),
             '`orderSeparatorIds`/`orderSeparatorId` were removed: use `orderIds`');
     }
 });
 
 await check('prolong: удалённые поля в объектной форме тоже отбиваются', async () => {
     await expectApiError(() => prolongClient.prepareProlong('mix', {
-        orderSeparatorIds: ['SEP'], ids: [PROXY_ID], periodId: '1m'
-    }), '`ids` was removed');
-    await expectApiError(() => prolongClient.prepareProlong('mix', { orderSeparatorId: 'SEP', orderIds: [ORDER_ID] }),
+        orderSeparatorIds: ['SEP'], orderIds: [ORDER_ID], periodId: '1m'
+    }), '`orderSeparatorIds`/`orderSeparatorId` were removed: use `orderIds`');
+    await expectApiError(() => prolongClient.prepareProlong('ipv4', { orderSeparatorId: 'SEP', ids: [PROXY_ID] }),
         'use `orderIds`');
 });
 
 await check('prolong: удалённые поля не уходят в сеть', async () => {
     const client = new ProxySellerUserApi({ key: 'k' });
     const calls = await captureRequest(client, async () => {
-        await expectApiError(() => client.prolongMake('ipv4', [PROXY_ID], '1m', '', { ids: [PROXY_ID] }), 'ids');
+        await expectApiError(() => client.prolongMake('mix', [ORDER_ID], '1m', '', { orderSeparatorId: 'SEP' }),
+            'orderSeparatorId');
         await expectApiError(() => client.prolongCalc('mix', { orderSeparatorIds: ['SEP'] }), 'orderSeparatorIds');
     });
     assertEqual(calls.length, 0, 'no request may be sent');
 });
 
-await check('prolong: явные ipIds/ips/orderIds из options уходят как переданы, пустые — нет', () => {
+await check('prolong: явные ids/ips/orderIds из options уходят как переданы, пустые — нет', () => {
     const explicit = prolongClient.prepareProlong('ipv4', null, '1m', '', {
-        ipIds: `${PROXY_ID}, `, orderIds: [], ips: []
+        ids: `${PROXY_ID}, `, orderIds: [], ips: []
     });
-    assertEqual(explicit.ipIds, [PROXY_ID], 'explicit ipIds lost');
+    assertEqual(explicit.ids, [PROXY_ID], 'explicit ids lost');
     assert(!('orderIds' in explicit) && !('ips' in explicit),
         `empty lists must not be sent, got ${JSON.stringify(explicit)}`);
 
-    const cleared = prolongClient.prepareProlong('ipv4', [PROXY_ID], '1m', '', { ipIds: [] });
-    assert(!('ipIds' in cleared), `explicit empty ipIds must clear the routed one, got ${JSON.stringify(cleared)}`);
+    const cleared = prolongClient.prepareProlong('ipv4', [PROXY_ID], '1m', '', { ids: [] });
+    assert(!('ids' in cleared), `explicit empty ids must clear the routed one, got ${JSON.stringify(cleared)}`);
 
     const ordered = prolongClient.prepareProlong('ipv6', ['1.2.3.4:26000'], '1m', '', { orderIds: [ORDER_ID] });
     assertEqual(ordered.orderIds, [ORDER_ID], 'explicit orderIds lost');
@@ -665,14 +666,14 @@ await check('prolong resident: любой непустой выбор — лок
         await expectApiError(() => prolongClient.prepareProlong(type, ['1.2.3.4', PROXY_ID], null, null), message);
         await expectApiError(() => prolongClient.prepareProlong(type, [PROXY_ID], null, null), message);
     }
-    for (const field of ['ipIds', 'ips', 'orderIds']) {
+    for (const field of ['ids', 'ips', 'orderIds']) {
         await expectApiError(() => prolongClient.prepareProlong('resident', null, null, null, { [field]: ['X'] }), message);
     }
 });
 
 await check('prolong resident: пустой выбор проходит и тело остаётся пустым', () => {
     for (const selection of [null, undefined, [], '']) {
-        assertBody(prolongClient.prepareProlong('resident', selection, null, null, { ipIds: [] }), {},
+        assertBody(prolongClient.prepareProlong('resident', selection, null, null, { ids: [] }), {},
             `${JSON.stringify(selection)}: body must be empty`);
     }
 });
@@ -687,7 +688,7 @@ await check('prolongCalc/prolongMake: тип доезжает и до разво
     const make = await captureRequest(client,
         () => client.prolongMake('ipv4', [PROXY_ID], '1m', 'SALE10'));
     assertEqual(make[0].uri, 'prolong/make/ipv4', 'make path');
-    assertBody(make[0].options.data, { ipIds: [PROXY_ID], periodId: '1m', coupon: 'SALE10' }, 'make body');
+    assertBody(make[0].options.data, { ids: [PROXY_ID], periodId: '1m', coupon: 'SALE10' }, 'make body');
 
     const byAddress = await captureRequest(client, () => client.prolongMake('mobile', ['10.0.0.1:8000:9000'], '1m'));
     assertBody(byAddress[0].options.data, { ips: ['10.0.0.1:8000:9000'], periodId: '1m', coupon: '' }, 'mobile body');
@@ -695,12 +696,12 @@ await check('prolongCalc/prolongMake: тип доезжает и до разво
 
 /////////////////////////////// autoprolong: тот же выбор ///////////////////////////////
 
-await check('autoProlongCalc ipv4: id прокси -> ipIds, платёжка и период на месте', async () => {
+await check('autoProlongCalc ipv4: id прокси -> ids, платёжка и период на месте', async () => {
     const client = new ProxySellerUserApi({ key: 'k' });
     const calls = await captureRequest(client,
         () => client.autoProlongCalc('ipv4', [PROXY_ID], '1m', { paymentId: 'balance' }));
     assertEqual(calls[0].uri, 'autoprolong/calc/ipv4', 'path');
-    assertBody(calls[0].options.data, { paymentId: 'balance', ipIds: [PROXY_ID], periodId: '1m' });
+    assertBody(calls[0].options.data, { paymentId: 'balance', ids: [PROXY_ID], periodId: '1m' });
 });
 
 await check('autoProlongEnable ipv6/mix/mix_isp: order_id -> orderIds', async () => {
@@ -738,7 +739,7 @@ await check('autoprolong resident: выбор отбивается локаль�
     const message = 'resident auto-prolong applies to the whole package';
     const calls = await captureRequest(client, async () => {
         await expectApiError(() => client.autoProlongDisable('resident', ['1.2.3.4']), message);
-        await expectApiError(() => client.autoProlongDisable('resident', null, { ipIds: [PROXY_ID] }), message);
+        await expectApiError(() => client.autoProlongDisable('resident', null, { ids: [PROXY_ID] }), message);
         await expectApiError(
             () => client.autoProlongEnable('resident', [PROXY_ID], null, { paymentId: 'balance' }), message);
         await expectApiError(
@@ -754,8 +755,8 @@ await check('autoprolong: удалённые поля и смесь id с адр
     const client = new ProxySellerUserApi({ key: 'k' });
     const calls = await captureRequest(client, async () => {
         await expectApiError(
-            () => client.autoProlongEnable('ipv4', [PROXY_ID], '1m', { paymentId: 'balance', ids: ['X'] }),
-            '`ids` was removed');
+            () => client.autoProlongEnable('ipv4', ['1.2.3.4'], '1m', { paymentId: 'balance', ids: [PROXY_ID] }),
+            'the server renews by ids and ignores ips');
         await expectApiError(
             () => client.autoProlongDisable('mix', null, { orderSeparatorIds: ['SEP'] }),
             '`orderSeparatorIds`/`orderSeparatorId` were removed: use `orderIds`');
@@ -775,7 +776,7 @@ await check('autoprolong: snake-алиасы по-прежнему привод�
         payment_id: 'balance', subscription_id: 'sub_1'
     }));
     assertBody(calls[0].options.data,
-        { paymentId: 'balance', subscriptionId: 'sub_1', ipIds: [PROXY_ID], periodId: '1m' });
+        { paymentId: 'balance', subscriptionId: 'sub_1', ids: [PROXY_ID], periodId: '1m' });
     assertNoRemovedFields(calls[0].options.data);
 });
 

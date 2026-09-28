@@ -356,8 +356,8 @@ really returns:
 
 | type | what you pass | sent as |
 |---|---|---|
-| `ipv4`, `isp` | the address — the `ip` field, e.g. `1.2.3.4` — or the proxy `id` | `ips` / `ipIds` |
-| `mobile` | the address — `ip` + `:` + `port_http` + `:` + `port_socks` — or the proxy `id` | `ips` / `ipIds` |
+| `ipv4`, `isp` | the address — the `ip` field, e.g. `1.2.3.4` — or the proxy `id` | `ips` / `ids` |
+| `mobile` | the address — `ip` + `:` + `port_http` + `:` + `port_socks` — or the proxy `id` | `ips` / `ids` |
 | `ipv6`, `mix`, `mix_isp` | the `order_id` of the order (also in `orderList()`) | `orderIds` |
 
 ```js
@@ -369,11 +369,11 @@ await api.prolongMake('ipv4', ips, '1m');        // deducts money
 ```
 
 The SDK routes every value by its shape: a value with a `.` or `:` is an address and goes to
-`ips`; anything else is an id and goes to `ipIds` — or to `orderIds` for `ipv6`, `mix` and
+`ips`; anything else is an id and goes to `ids` — or to `orderIds` for `ipv6`, `mix` and
 `mix_isp`. An array, a comma-separated string and a `Set` all work.
 
 For `ipv4`, `isp` and `mobile` pass **either ids or addresses in one call, not both**. The server
-renews by `ipIds` and ignores `ips` when both are present, so the addresses would silently drop
+renews by `ids` and ignores `ips` when both are present, so the addresses would silently drop
 out of a paid renewal; the SDK throws an `ApiError` (`Mixing proxy ids and addresses in one call
 is not supported…`) instead of sending such a request — whether the mix comes from one list, from
 the list plus `options`, or from the object form.
@@ -421,18 +421,20 @@ A proxy `id` and an `order_id` look alike (both are ObjectIds), so pass the `ord
 `Incorrect orderIds` (code 29) — the same answer you get when any of the orders is not yours, has
 no active proxy of that type, or nothing was selected at all. `ipv6` is no longer renewed by
 `host:port`: an address sent for these types goes to `ips`, and the server answers
-`[ips] is not applicable for ipv6: prolong by [orderIds]`. (Here a list with both order ids and
-addresses is not rejected locally — nothing is lost silently, the server rejects the addresses
-and names the field.)
+`[ips] is not applicable for ipv6: prolong by [orderIds]` with code 0. (Here a list with both
+order ids and addresses is not rejected locally — nothing is lost silently, the server rejects
+the addresses and names the field.)
 
 <details>
 <summary>The object form</summary>
 
-Pass an object instead of the selection to write the body yourself: `ipIds`, `ips`, `orderIds`,
+Pass an object instead of the selection to write the body yourself: `ids`, `ips`, `orderIds`,
 `periodId`/`periodCode`, `paymentId`/`paymentCode`, `coupon`. The fields go out as given (empty
-lists are dropped), and the server checks the selection against the type — `ipIds` for `ipv6`,
-for example, is rejected with `[ipIds] is not applicable for ipv6: prolong by [orderIds]`.
-`ipIds` together with `ips` for `ipv4` / `isp` / `mobile` throws locally, as described above:
+lists are dropped), and the server checks the selection against the type: a field of the wrong
+kind is rejected with code 0 and an error that names the right one — `ids` for `ipv6`, for
+example, with `[ids] is not applicable for ipv6: prolong by [orderIds]`, and `orderIds` for
+`ipv4` with `[orderIds] is not applicable for ipv4: prolong by [ids]`.
+`ids` together with `ips` for `ipv4` / `isp` / `mobile` throws locally, as described above:
 
 ```js
 await api.prolongMake('mix', { orderIds: ['ORDER_ID'], periodId: '1m', coupon: 'SALE10' });
@@ -444,14 +446,13 @@ The same fields are accepted in the `options` argument of the positional call.
 
 ### Removed request fields
 
-`ids`, `orderSeparatorIds` and `orderSeparatorId` are **no longer part of the contract** — the
-server does not read them. Rather than dropping them and sending a renewal without the selection
-you meant, the SDK throws an `ApiError` that names the replacement, whether the field comes in
+`orderSeparatorIds` and `orderSeparatorId` are **no longer part of the contract** — the server
+does not read them. Rather than dropping them and sending a renewal without the selection you
+meant, the SDK throws an `ApiError` that names the replacement, whether the field comes in
 `options` or in the object form:
 
 | removed field | message | use instead |
 |---|---|---|
-| `ids` | `` `ids` was removed: use `ipIds` (ipv4/isp/mobile) or `orderIds` (ipv6/mix/mix_isp) `` | `ipIds` or `orderIds` |
 | `orderSeparatorIds`, `orderSeparatorId` | `` `orderSeparatorIds`/`orderSeparatorId` were removed: use `orderIds` `` | `orderIds` |
 
 The key alone triggers it, even with an empty value.
@@ -473,8 +474,8 @@ await api.autoProlongEnable('ipv6', ['ORDER_ID'], '1m', { paymentId: 'balance' }
 ```
 
 The same local checks apply as in `prolong/*`: ids and addresses are not mixed for `ipv4` /
-`isp` / `mobile`, and `ids` / `orderSeparatorIds` / `orderSeparatorId` throw with their
-replacement (see [Removed request fields](#removed-request-fields)).
+`isp` / `mobile`, and `orderSeparatorIds` / `orderSeparatorId` throw with their replacement (see
+[Removed request fields](#removed-request-fields)).
 
 `paymentId` is **mandatory** for `calc` and `enable` — the charge happens while you are away, so
 the payment system cannot be guessed. Only `balance` and `paddle_subscription` are accepted: a
@@ -489,15 +490,18 @@ await api.autoProlongEnable('resident', null, null, { paymentId: 'balance', tari
 await api.autoProlongDisable('resident');
 ```
 
-Any selection for `resident` — a non-empty list argument, or `ipIds` / `ips` / `orderIds` in
-`options` or in the object form — throws an `ApiError` locally (`resident auto-prolong applies to
-the whole package: do not pass proxy or order ids`). It is never stripped silently: a `disable`
-meant for a few addresses would switch auto-renewal off for the whole package.
+`resident` has no selection fields at all — the server rejects any of `ids` / `ips` / `orderIds`
+with `[ids] is not applicable for resident: auto-prolong applies to the whole package`. The SDK
+does not send them: any selection for `resident` — a non-empty list argument, or `ids` / `ips` /
+`orderIds` in `options` or in the object form — throws an `ApiError` locally (`resident
+auto-prolong applies to the whole package: do not pass proxy or order ids`). It is never stripped
+silently: a `disable` meant for a few addresses would switch auto-renewal off for the whole
+package.
 
 Three things about the answers before you parse them:
 
-* **`ipIds` and `orderIds` are not an echo.** `enable` and `disable` return the proxies actually
-  affected in `ipIds` and their orders in `orderIds`; `quantity` counts the proxies. For `ipv6`,
+* **`ids` and `orderIds` are not an echo.** `enable` and `disable` return the proxies actually
+  affected in `ids` and their orders in `orderIds`; `quantity` counts the proxies. For `ipv6`,
   `mix` and `mix_isp` that is every active proxy of the orders you sent. For `resident` both lists
   are empty and `quantity` is 1 — the package.
 * **Not enough money is not an error throw.** `calc` answers `status: "error"` with a *filled*
@@ -697,22 +701,24 @@ Changes made after the 2.0 release, in the order the server shipped them:
   missing value is simply not sent instead of failing the call. The header still goes out
   whenever you provide a value (constructor, `setFingerprint()`, per call) — see
   [Sending a fingerprint](#sending-a-fingerprint).
-- **Renewal selection depends on the type, and three request fields are gone** (breaking) — see
-  [Renewing proxies](#renewing-proxies). `prolong/*` and `autoprolong/*` take `ipIds` (proxy
-  `id` values) or `ips` (addresses) for `ipv4`, `isp` and `mobile`, and `orderIds` (`order_id`
-  values) for `ipv6`, `mix` and `mix_isp`, which are renewed only as whole orders. A field of the
-  wrong kind is rejected with an error naming it, e.g.
-  `[ipIds] is not applicable for ipv6: prolong by [orderIds]`, and `resident` takes no selection
-  at all. `ids`, `orderSeparatorIds` and `orderSeparatorId` were removed: the server no longer
-  reads them, and the SDK throws an `ApiError` naming the replacement if you still pass them.
-  `ipv6` is no longer renewed by `host:port` — pass its `order_id`. The SDK routes the positional
-  selection by type for you and throws locally, before any request, on two more cases: proxy ids
-  mixed with addresses for `ipv4` / `isp` / `mobile` (the server would renew by `ipIds` and drop
-  the addresses), and any selection for `resident` (it applies to the whole package). The helpers
-  `prepareProlong()` and `prepareAutoProlong()` now take the type as their first argument.
-  In the responses, `prolong/make` adds `orderIds` (every renewed order; `orderId` stays and is
-  `orderIds[0]`, `listBaseOrderNumbers` has one number per renewed order or mix package), and
-  `autoprolong/enable|disable` renamed `ids` to `ipIds` and added `orderIds`.
+- **Renewal selection depends on the type, and two request fields are gone** (breaking) — see
+  [Renewing proxies](#renewing-proxies). `prolong/*` and `autoprolong/*` take `ids` (proxy `id`
+  values) or `ips` (addresses) for `ipv4`, `isp` and `mobile`, as before, and `orderIds`
+  (`order_id` values) instead of `ids` / `ips` for `ipv6`, `mix` and `mix_isp`, which are renewed
+  only as whole orders. A field of the wrong kind is rejected with code 0 and an error naming the
+  right one, e.g. `[ids] is not applicable for ipv6: prolong by [orderIds]` or
+  `[orderIds] is not applicable for ipv4: prolong by [ids]`, and `resident` takes no selection
+  at all. `orderSeparatorIds` and `orderSeparatorId` were removed: the server no longer reads
+  them, and the SDK throws an `ApiError` naming the replacement (`orderIds`) if you still pass
+  them. `ipv6` is no longer renewed by `host:port` — pass its `order_id`. The SDK routes the
+  positional selection by type for you and throws locally, before any request, on two more cases:
+  proxy ids mixed with addresses for `ipv4` / `isp` / `mobile` (the server would renew by `ids`
+  and drop the addresses), and any selection for `resident` (it applies to the whole package).
+  The helpers `prepareProlong()` and `prepareAutoProlong()` now take the type as their first
+  argument. In the responses, `prolong/make` adds `orderIds` (every renewed order; `orderId`
+  stays and is `orderIds[0]`, `listBaseOrderNumbers` has one number per renewed order or mix
+  package), and `autoprolong/enable|disable` adds `orderIds` — the orders of the proxies listed
+  in `ids`.
 - **`order/list` is new** — `orderList()`, see [Listing orders](#listing-orders). Its query
   filters and response fields use snake_case names such as `start_date` and `is_extend`, and its
   `data` is a `metadata` + `items` pair rather than a flat list.

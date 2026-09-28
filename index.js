@@ -73,7 +73,7 @@ const PROLONG_REFERENCE_PAIRS = Object.freeze([
 /**
  * prolong/* и autoprolong/*: типы, которые продаются и продлеваются только ЦЕЛЫМИ заказами.
  * Выбор для них — orderIds (`order_id` из proxy/list или order/list). Остальные типы (ipv4,
- * isp, mobile) продлеваются по отдельным прокси: ipIds (`id` из proxy/list) либо ips (адреса).
+ * isp, mobile) продлеваются по отдельным прокси: ids (`id` из proxy/list) либо ips (адреса).
  */
 const ORDER_PROLONG_TYPES = Object.freeze(['ipv6', 'mix', 'mix_isp']);
 
@@ -85,13 +85,13 @@ const ORDER_PROLONG_TYPES = Object.freeze(['ipv6', 'mix', 'mix_isp']);
 const RESIDENT_PROLONG_TYPES = Object.freeze(['resident', 'residential']);
 
 /** Поля выбора prolong/* и autoprolong/*: пустыми в тело не уходят. */
-const PROLONG_SELECTION_FIELDS = Object.freeze(['ipIds', 'ips', 'orderIds']);
+const PROLONG_SELECTION_FIELDS = Object.freeze(['ids', 'ips', 'orderIds']);
 
 /**
  * Поля тела prolong/* (и основы тела autoprolong/*), которые SDK берёт из options или из
- * объектной формы вызова. ids, orderSeparatorIds и orderSeparatorId убраны из контракта, и
- * сервер их больше не читает: переданные — локальная ApiError с именем замены (ipIds / ips для
- * ipv4, isp, mobile и orderIds для ipv6, mix, mix_isp), см. _assertNoRemovedProlongFields().
+ * объектной формы вызова. orderSeparatorIds и orderSeparatorId убраны из контракта, и сервер
+ * их больше не читает: переданные — локальная ApiError с именем замены (orderIds), см.
+ * _assertNoRemovedProlongFields().
  */
 const PROLONG_BODY_FIELDS = Object.freeze([
     ...PROLONG_SELECTION_FIELDS, 'coupon', 'periodId', 'periodCode', 'paymentId', 'paymentCode'
@@ -1591,7 +1591,7 @@ class ProxySellerUserApi {
      * ip + ':' + port_http + ':' + port_socks у mobile. Адреса уходят в `ips`. Всё остальное —
      * идентификатор, и его поле задаёт тип:
      *   ipv4, isp, mobile   — прокси продлеваются по отдельности: это `id` прокси из proxy/list,
-     *                         уходит в `ipIds`;
+     *                         уходит в `ids`;
      *   ipv6, mix, mix_isp  — продаются и продлеваются только целыми заказами: это `order_id`
      *                         из proxy/list или order/list, уходит в `orderIds`.
      * Id прокси и id заказа — оба ObjectId, по форме их не отличить, поэтому для ipv6/mix/mix_isp
@@ -1605,7 +1605,7 @@ class ProxySellerUserApi {
      * Пустые списки не возвращаются — поле без значений в тело не попадает.
      * @param {string} type
      * @param {array|string} ipsOrIds
-     * @return {{ipIds?: string[], orderIds?: string[], ips?: string[]}}
+     * @return {{ids?: string[], orderIds?: string[], ips?: string[]}}
      */
     _splitProlongTargets(type, ipsOrIds) {
         const kind = this._normalizeProlongType(type);
@@ -1617,7 +1617,7 @@ class ProxySellerUserApi {
         }
         const routed = {};
         if (ids.length) {
-            routed[ORDER_PROLONG_TYPES.includes(kind) ? 'orderIds' : 'ipIds'] = ids;
+            routed[ORDER_PROLONG_TYPES.includes(kind) ? 'orderIds' : 'ids'] = ids;
         }
         if (ips.length) {
             routed.ips = ips;
@@ -1630,15 +1630,17 @@ class ProxySellerUserApi {
      *
      * Позиционный выбор раскладывается по полям с учётом типа — см. _splitProlongTargets().
      * Поля из options (либо из объекта на месте выбора — тогда это всё тело целиком) уходят как
-     * переданы, поверх разложенного: ipIds, ips, orderIds, coupon, periodId/periodCode,
-     * paymentId/paymentCode. Подходит ли поле выбора типу, проверяет сервер. Пустые списки не
+     * переданы, поверх разложенного: ids, ips, orderIds, coupon, periodId/periodCode,
+     * paymentId/paymentCode. Подходит ли поле выбора типу, проверяет сервер: поле не того вида
+     * он отбивает с кодом 0, называя нужное ("[ids] is not applicable for ipv6: prolong by
+     * [orderIds]", "[orderIds] is not applicable for ipv4: prolong by [ids]"). Пустые списки не
      * отправляются.
      *
      * Локально отбиваются три случая, которые сервер обработал бы молча не так, как ждёт
      * вызывающий:
-     *   - ids, orderSeparatorIds, orderSeparatorId — убраны из контракта, сервер их не читает
-     *     (_assertNoRemovedProlongFields, ошибка называет замену);
-     *   - ipIds вместе с ips у ipv4/isp/mobile — сервер продлевает по ipIds и игнорирует ips,
+     *   - orderSeparatorIds, orderSeparatorId — убраны из контракта, сервер их не читает
+     *     (_assertNoRemovedProlongFields, ошибка называет замену — orderIds);
+     *   - ids вместе с ips у ipv4/isp/mobile — сервер продлевает по ids и игнорирует ips,
      *     адреса выпали бы из оплаченного продления;
      *   - любой выбор у резидентки — автопродление там применяется ко всему пакету
      *     (оба — _assertProlongSelection).
@@ -1681,34 +1683,27 @@ class ProxySellerUserApi {
     }
 
     /**
-     * ids, orderSeparatorIds и orderSeparatorId убраны из контракта: сервер их больше не читает.
+     * orderSeparatorIds и orderSeparatorId убраны из контракта: сервер их больше не читает.
      * Молча выбросить их нельзя — вызов ушёл бы без того выбора, который задумывал вызывающий, —
-     * поэтому переданное поле (даже пустое) отбивается с именем замены. Та же логика, что у
-     * удалённых полей balance/autotopup/set.
+     * поэтому переданное поле (даже пустое) отбивается с именем замены (orderIds). Та же логика,
+     * что у удалённых полей balance/autotopup/set.
      * @param {object} values options либо объектная форма вызова
      * @throws ApiError
      */
     _assertNoRemovedProlongFields(values) {
         const has = (key) => Object.prototype.hasOwnProperty.call(values, key);
-        const problems = [];
-        if (has('ids')) {
-            problems.push('`ids` was removed: use `ipIds` (ipv4/isp/mobile) or `orderIds` (ipv6/mix/mix_isp)');
-        }
         if (has('orderSeparatorIds') || has('orderSeparatorId')) {
-            problems.push('`orderSeparatorIds`/`orderSeparatorId` were removed: use `orderIds`');
-        }
-        if (problems.length > 0) {
-            throw new ApiError(problems.join('; '));
+            throw new ApiError('`orderSeparatorIds`/`orderSeparatorId` were removed: use `orderIds`');
         }
     }
 
     /**
-     * Проверяет уже разложенный выбор (в payload остались только непустые ipIds/ips/orderIds).
+     * Проверяет уже разложенный выбор (в payload остались только непустые ids/ips/orderIds).
      *
      * Резидентка: автопродление применяется ко всему пакету, и любой выбор — ошибка. Выбросить его
      * молча нельзя: disable, адресованный паре адресов, выключил бы автопродление всего пакета.
      *
-     * ipv4/isp/mobile: ipIds вместе с ips не отправляем — сервер продлевает по ipIds и игнорирует
+     * ipv4/isp/mobile: ids вместе с ips не отправляем — сервер продлевает по ids и игнорирует
      * ips, так что адреса молча выпали бы из оплаченного продления. У ipv6/mix/mix_isp смесь
      * допустима: id уходят в orderIds, а адреса в ips сервер отбивает сам, называя поле.
      * @param {string} type
@@ -1721,15 +1716,15 @@ class ProxySellerUserApi {
             if (PROLONG_SELECTION_FIELDS.some((key) => payload[key] !== undefined)) {
                 throw new ApiError(
                     'resident auto-prolong applies to the whole package: do not pass proxy or order ids ' +
-                    '(pass null as the selection and no ipIds / ips / orderIds in options)'
+                    '(pass null as the selection and no ids / ips / orderIds in options)'
                 );
             }
             return;
         }
-        if (!ORDER_PROLONG_TYPES.includes(kind) && payload.ipIds !== undefined && payload.ips !== undefined) {
+        if (!ORDER_PROLONG_TYPES.includes(kind) && payload.ids !== undefined && payload.ips !== undefined) {
             throw new ApiError(
                 'Mixing proxy ids and addresses in one call is not supported: pass either ids or ' +
-                `addresses. For ${kind || 'this type'} the server renews by ipIds and ignores ips when ` +
+                `addresses. For ${kind || 'this type'} the server renews by ids and ignores ips when ` +
                 'both are sent, so the addresses would silently drop out of the renewal.'
             );
         }
@@ -1742,17 +1737,17 @@ class ProxySellerUserApi {
      *   ipv4, isp, mobile   — individual proxies. Pass the addresses exactly as proxy/list
      *                         returns them — the 'ip' field ('1.2.3.4') for ipv4/isp,
      *                         ip + ':' + port_http + ':' + port_socks for mobile — or the proxy
-     *                         'id'. Addresses are sent as ips, proxy ids as ipIds.
+     *                         'id'. Addresses are sent in ips, proxy ids in ids.
      *   ipv6, mix, mix_isp  — whole orders only. Pass the 'order_id' from proxy/list or
      *                         order/list: it is sent as orderIds, and every active proxy of that
      *                         type in those orders is renewed (for mix/mix_isp — the mix packages
      *                         of those orders). ipv6 is no longer renewed by 'host:port'.
      * Each value is routed by its shape — a '.' or ':' makes it an address. For ipv4/isp/mobile
-     * pass either ids or addresses in one call, not both: the server renews by ipIds and ignores
+     * pass either ids or addresses in one call, not both: the server renews by ids and ignores
      * ips when both are sent, so the SDK throws instead of letting the addresses drop out of the
      * renewal. A proxy id and an order id look alike, so for ipv6/mix/mix_isp a proxy id lands in
      * orderIds and the server answers "Incorrect orderIds" (code 29); an address lands in ips and
-     * the server answers "[ips] is not applicable for <type>: prolong by [orderIds]".
+     * the server answers "[ips] is not applicable for <type>: prolong by [orderIds]" (code 0).
      *
      * @param string type - ipv4 | isp | mobile | ipv6 | mix | mix_isp
      * @param {array|string|object} ipsOrIds addresses / ids as described above: an array (or a
@@ -1760,12 +1755,12 @@ class ProxySellerUserApi {
      *   payload instead.
      * @param {string} periodId ObjectId or period code (e.g. '1m') — prolong runs the same fallback
      * @param string coupon
-     * @param {object} options fields with no positional slot: ipIds / ips / orderIds (sent as
+     * @param {object} options fields with no positional slot: ids / ips / orderIds (sent as
      *   given, on top of the routed values), periodCode, paymentId/paymentCode.
-     *   ids, orderSeparatorIds and orderSeparatorId were removed from the contract: passing
-     *   them throws an ApiError that names the replacement.
+     *   orderSeparatorIds and orderSeparatorId were removed from the contract: passing them
+     *   throws an ApiError that names the replacement (orderIds).
      * @return object
-     * @throws ApiError locally for a removed field, or for ipIds together with ips on
+     * @throws ApiError locally for a removed field, or for ids together with ips on
      *   ipv4/isp/mobile
      */
     async prolongCalc(type, ipsOrIds, periodId = null, coupon = '', options = {}) {
@@ -1783,7 +1778,7 @@ class ProxySellerUserApi {
      * @param {array|string|object} ipsOrIds see prolongCalc(); an object is the whole payload
      * @param {string} periodId ObjectId or period code (e.g. '1m') — prolong runs the same fallback
      * @param string coupon
-     * @param {object} options fields with no positional slot: ipIds / ips / orderIds, periodCode,
+     * @param {object} options fields with no positional slot: ids / ips / orderIds, periodCode,
      *   paymentId/paymentCode
      * @return object {orderId, orderIds, total, listBaseOrderNumbers, balance}: orderIds lists
      *         every renewed order (one request can renew several), orderId is orderIds[0];
@@ -1792,7 +1787,7 @@ class ProxySellerUserApi {
      * @throws ApiError при нехватке средств: продление НЕ состоялось, причина приходит как
      *         code 16 "Insufficient funds on balance", а расчёт с warning/balance/total
      *         остаётся доступен в error.body.data. Локально, до запроса — в тех же случаях,
-     *         что у prolongCalc(): удалённое поле или ipIds вместе с ips у ipv4/isp/mobile
+     *         что у prolongCalc(): удалённое поле или ids вместе с ips у ipv4/isp/mobile
      */
     async prolongMake(type, ipsOrIds, periodId = null, coupon = '', options = {}) {
         // Отдельная пост-проверка результата не нужна: нехватку средств сервер кладёт в
@@ -1809,10 +1804,10 @@ class ProxySellerUserApi {
     /////////////////////////////// Autoprolong ///////////////////////////////
 
     /**
-     * Тело autoprolong/*: тот же выбор, что у prolong/* (ipIds / ips для ipv4, isp, mobile;
+     * Тело autoprolong/*: тот же выбор, что у prolong/* (ids / ips для ipv4, isp, mobile;
      * orderIds для ipv6, mix, mix_isp; у резидентки — никакого), те же periodId/periodCode и
      * paymentId/paymentCode, плюс subscriptionId и tarifId. Те же и локальные отказы (см.
-     * prepareProlong): удалённые ids / orderSeparatorIds / orderSeparatorId, ipIds вместе с ips
+     * prepareProlong): удалённые orderSeparatorIds / orderSeparatorId, ids вместе с ips
      * у ipv4/isp/mobile и любой выбор у резидентки.
      *
      * Купона здесь нет специально: автопродление промокоды НЕ применяет нигде, и сервер
@@ -1825,7 +1820,7 @@ class ProxySellerUserApi {
      * @param {string} type тип из пути — от него зависит, в какое поле уйдёт выбор
      * @param {array|string|object} ipsOrIds выбор, как у prolongCalc(), либо объект = всё тело
      * @param {string} periodId ObjectId or period code (e.g. '1m')
-     * @param {object} options subscriptionId, tarifId, ipIds / ips / orderIds, paymentId/paymentCode
+     * @param {object} options subscriptionId, tarifId, ids / ips / orderIds, paymentId/paymentCode
      * @return {object}
      * @throws ApiError в случаях, перечисленных выше
      */
@@ -1926,13 +1921,13 @@ class ProxySellerUserApi {
      * @param string type - ipv4 | isp | mobile | ipv6 | mix | mix_isp | resident
      * @param {array|string|object} ipsOrIds выбор, как описано выше; для type='resident' — null:
      *        единица правки там ПАКЕТ, тело состоит из paymentId и необязательного tarifId, а
-     *        любой непустой выбор (список, ipIds, ips, orderIds) — локальная ApiError
+     *        любой непустой выбор (список, ids, ips, orderIds) — локальная ApiError
      * @param {string} periodId ObjectId or period code (e.g. '1m'); резидентке не нужен —
      *        период берётся из её тарифа
-     * @param {object} options subscriptionId, tarifId, ipIds / ips / orderIds, paymentId/paymentCode
+     * @param {object} options subscriptionId, tarifId, ids / ips / orderIds, paymentId/paymentCode
      * @return object
-     * @throws ApiError при type='scraper', без платёжки, при выборе у резидентки, при ipIds вместе
-     *         с ips у ipv4/isp/mobile и при удалённых ids / orderSeparatorIds / orderSeparatorId
+     * @throws ApiError при type='scraper', без платёжки, при выборе у резидентки, при ids вместе
+     *         с ips у ipv4/isp/mobile и при удалённых orderSeparatorIds / orderSeparatorId
      */
     async autoProlongCalc(type, ipsOrIds = null, periodId = null, options = {}) {
         this._assertAutoProlongType(type, 'calc');
@@ -1945,12 +1940,11 @@ class ProxySellerUserApi {
      * Enable automatic extension for proxies. Сейчас ничего не списывается — платёжка и период
      * лишь привязываются к выбранным прокси.
      *
-     * data: warning, autoProlong, quantity, ipIds[], orderIds[], days, paymentId, chargeDate,
-     * dateEnd. quantity/ipIds — прокси, которые РЕАЛЬНО затронуты, а не эхо запроса: у ipv6, mix
-     * и mix_isp автопродление включается целым заказом, так что в ipIds попадают все активные
+     * data: warning, autoProlong, quantity, ids[], orderIds[], days, paymentId, chargeDate,
+     * dateEnd. quantity/ids — прокси, которые РЕАЛЬНО затронуты, а не эхо запроса: у ipv6, mix
+     * и mix_isp автопродление включается целым заказом, так что в ids попадают все активные
      * прокси присланных заказов; orderIds — заказы затронутых прокси, без повторов. У резидентки
-     * приходит quantity=1 и пустые ipIds/orderIds — единица правки там пакет. (Раньше список
-     * затронутых прокси назывался ids.)
+     * приходит quantity=1 и пустые ids/orderIds — единица правки там пакет.
      *
      * warning заполнен, если баланса на предстоящее списание не хватит, — та же формулировка,
      * что у autoProlongCalc(). Включение при этом состоялось: деньги нужны к chargeDate, не сейчас.
@@ -1959,7 +1953,7 @@ class ProxySellerUserApi {
      *        null (любой непустой выбор — локальная ApiError)
      * @param {string} periodId ObjectId or period code (e.g. '1m'); резидентке не нужен
      * @param {object} options subscriptionId (обязателен для paddle_subscription), tarifId,
-     *        ipIds / ips / orderIds, paymentId/paymentCode
+     *        ids / ips / orderIds, paymentId/paymentCode
      * @return object
      * @throws ApiError при type='scraper', без платёжки и в тех же случаях выбора, что у
      *         autoProlongCalc()
@@ -1978,14 +1972,14 @@ class ProxySellerUserApi {
      * опасен — disable, адресованный паре адресов, выключил бы автопродление всего пакета, поэтому
      * он отбивается локально.
      *
-     * data — та же форма, что у autoProlongEnable(): ipIds[] затронутых прокси и orderIds[] их
+     * data — та же форма, что у autoProlongEnable(): ids[] затронутых прокси и orderIds[] их
      * заказов (у ipv6, mix и mix_isp — все активные прокси присланных заказов). days/paymentId/
      * chargeDate приходят null (у резидентки days остаётся — это срок её тарифа), а dateEnd
      * остаётся — прокси не исчезает, он просто перестаёт продлеваться сам.
      * @param string type - ipv4 | isp | mobile | ipv6 | mix | mix_isp | resident
      * @param {array|string|object} ipsOrIds выбор, как у autoProlongCalc(); для type='resident' —
      *        null (любой непустой выбор — локальная ApiError)
-     * @param {object} options ipIds / ips / orderIds и прочие поля тела
+     * @param {object} options ids / ips / orderIds и прочие поля тела
      * @return object
      * @throws ApiError при type='scraper' и в тех же случаях выбора, что у autoProlongCalc()
      */
