@@ -44,6 +44,22 @@ api.setPaymentCode('paddle_subscription');
 crypto, a new card) ends on a hosted payment page a headless client cannot complete, so the
 server rejects it. A single call can pass `{ paymentCode: 'balance' }` in its options instead.
 
+**`setPaymentCode()` and `setPaymentId()` only set the client's default; the payment system of a
+call wins.** When a call passes a non-empty `paymentCode` or `paymentId` — in its options or in
+the object form — the client's default is left out of that request entirely: neither its code nor
+its id is sent. Only a call that passes neither uses the default (an empty `''` / `null` in the
+call does not wipe it). Within one level the code still beats the id, exactly as the server reads
+them.
+
+```js
+api.setPaymentCode('paddle_subscription');
+await api.orderMakeIpv4('USA', '1m', 1, null, null, 'scraping', { paymentId: 'balance' });
+// sends paymentId: 'balance' and no paymentCode — paid from the balance, not with the card
+```
+
+When several flows share one client, pass the payment system per call rather than switching the
+default between calls: a `setPaymentCode()` made by one flow is seen by the calls of every other.
+
 `balancePaymentsList()` is **not** where these come from. It lists the systems you can **top up**
 the balance with, for `balanceAdd()`, and the balance itself is never in it. Top-ups are the one
 place where an id is unavoidable: several payment systems share the same internal code (a single
@@ -184,7 +200,7 @@ otherwise it throws an `ApiError` built from `errors[0]`.
 | `code` | `errors[0].code` (business code, see below) |
 | `customData` | `errors[0].customData` — e.g. the allowed boundary for auto top-up validation |
 | `errors` | the **whole** `errors` array |
-| `body` | the whole envelope as received |
+| `body` | the whole envelope as received; for an answer without the envelope — its body |
 | `httpStatus` | HTTP status (200 in almost every failure) |
 
 **Always look at `error.errors`, not only at `error.message`.** Access failures — invalid or
@@ -211,13 +227,37 @@ sides. Two responses bypass the envelope entirely: file downloads (see below) an
 `ext`, which the server rejects with a bare plain-text HTTP 400 — the SDK validates `ext`
 locally to avoid it (max 250 chars, no CR, LF, `/` or `\`).
 
+**Money and write requests succeed only on `status: "success"`.** For `order/make`,
+`prolong/make/{type}`, `balance/add` and every write endpoint (the *money* and *write* rows of the
+table in [Rate limits and the request queue](#rate-limits-and-the-request-queue)) anything else
+is an `ApiError`. An envelope with `errors` is the usual business error. An answer without the
+envelope — an HTML page, an empty body, `204`, truncated JSON, a bare value — or an envelope whose
+`status` is not `success` and that carries no `errors` throws
+`Unexpected response from <endpoint> (HTTP <status>, …); the request may have been executed — check before retrying`,
+with the first 500 characters of the body in `error.body`: such an answer does not tell whether the
+request was carried out, see [Timeouts and retries on payments](#timeouts-and-retries-on-payments).
+Reads are parsed as before, and so are the `*/calc` endpoints: their `status: "error"` with a
+filled `data` and an empty `errors[]` is how they report insufficient funds, and `data` is returned.
+
+**The API key never appears in an error.** It travels in the URL path, and a server or proxy in
+front of the API may echo that path back — a default Spring error body carries it in `path`, an
+HTML error page in its text. In every `ApiError` the SDK throws the key is replaced with `***` —
+in `message`, `body`, `errors` and `customData`, whether it appears as is, URL-encoded or in any
+letter case — and the transport error behind a network failure is not attached as `cause`
+(its config holds the URL). `console.log(api)`, `util.inspect(api)` and `JSON.stringify(api)` show
+the client's settings with `***` in place of the key; `api.baseURL` itself is unchanged.
+
 ## Rate limits and the request queue
 
 The client paces its own requests so that one API key stays under the API's limits without any
 code on your side. This is on by default.
 
 Every request falls into one of three categories by its endpoint path — not by its HTTP method:
-the `*/calc` endpoints are `POST`, but they change nothing.
+the `*/calc` endpoints are `POST`, but they change nothing. The same categories decide the
+timeout (money requests use `moneyTimeout`, see
+[Timeouts and retries on payments](#timeouts-and-retries-on-payments)) and how the answer is
+checked (money and write requests succeed only on `status: "success"`, see
+[Error handling](#error-handling)).
 
 | category | endpoints |
 |---|---|
@@ -279,8 +319,61 @@ themselves: they do not coordinate and together can go over the limits. Create o
 key and share it across your code. When several processes do share a key, the server can still
 answer code 57 or the access-denied triple; handle them as you would without the queue.
 
-Keep a request `timeout` (30 s by default): the lane waits for the previous write to finish, so a
-request that never gets an answer would hold up every write behind it.
+Keep a request `timeout` (30 s by default, 120 s for money requests — see
+[Timeouts and retries on payments](#timeouts-and-retries-on-payments)): the lane waits for the
+previous write to finish, so a request that never gets an answer would hold up every write behind
+it.
+
+## Timeouts and retries on payments
+
+Money requests — `order/make` (`orderMake()` and every `orderMake*()` helper),
+`prolong/make/{type}` (`prolongMake()`) and `balance/add` (`balanceAdd()`) — have their own
+timeout, **120 s** by default (`moneyTimeout`); every other request keeps `timeout`, 30 s by
+default. The server assembles an order synchronously — a large MIX order takes longer than 30 s —
+and cutting it off would leave you with an order that was paid while your code saw an error. If
+you set `timeout` explicitly, money requests wait at least as long: `max(timeout, moneyTimeout)`.
+`0` means no timeout, as in Axios.
+
+```js
+const api = new ProxySellerUserApi({
+  key: 'YOUR_API_KEY',
+  timeout: 15_000,        // every request
+  moneyTimeout: 180_000   // order/make, prolong/make, balance/add — default 120_000
+});
+```
+
+**A timeout, a dropped connection or an HTTP 5xx on a money request means the outcome is
+unknown.** The request may have reached the API, and the order may have been created and paid. The
+API has no idempotency key, so sending the same request again can buy the same thing twice. The
+SDK never repeats these requests on its own — the one exception is HTTP 429 from the network edge,
+which is retried because that request never reached the API (see
+[Rate limits and the request queue](#rate-limits-and-the-request-queue)). Before you retry, check
+what actually happened:
+
+| call | check before retrying |
+|---|---|
+| `order/make` | `orderList()` — is there a new order with these items? `proxyList()` shows its proxies |
+| `prolong/make/{type}` | `proxyList()` — has `date_end` moved? `orderList()` lists the renewal (`is_extend: 'Y'`) |
+| `balance/add` | `balance()` and the balance history in your account |
+
+Code 57, `Prolong for this order is already in progress`, means an earlier renewal of the same
+order is still running — wait for it and check, do not resend.
+
+What you catch is always an `ApiError`:
+
+| what happened | `ApiError` |
+|---|---|
+| timeout | `code: 'ECONNABORTED'` (`'ETIMEDOUT'` with Axios' `transitional.clarifyTimeoutError`), `httpStatus: null`, message `timeout of 120000ms exceeded` |
+| connection dropped or refused | the network `code` (`'ECONNRESET'`, `'ECONNREFUSED'`, …), `httpStatus: null` |
+| HTTP 5xx | `httpStatus` 500–599 |
+| a 2xx answer without a success envelope | message `Unexpected response from …; the request may have been executed — check before retrying` |
+
+An error inside the envelope (`errors[]`) is the API's own answer, so the request did reach it.
+The validation errors — code 16 `Insufficient funds on balance` and the like — come before any
+charge: fix the request and send it again. Two answers can come after the charge, though, and
+deserve the same check as a timeout: `Prolong was not applied` (the renewal was rejected
+downstream; a balance payment is returned to the balance, and in a multi-order renewal the other
+orders may already be renewed) and code 35 `Unknown error`.
 
 ## Orders
 
@@ -695,12 +788,29 @@ const geo = JSON.parse(Buffer.from(await api.residentGeo()).toString('utf8'));
   so check the `status` field — a failed delete is not otherwise distinguishable from a
   successful one.
 - `balanceAdd()` uses its explicit `paymentId`, then falls back to `setPaymentId()`;
-  `paymentCode` is not resolved here.
+  `paymentCode` is not resolved here — passed in the call, it throws locally even when
+  `setPaymentId()` is set, because the payment system of a call always replaces the default.
 
 ## Keeping up with the server
 
 Changes made after the 2.0 release, in the order the server shipped them:
 
+- **Behaviour change: the payment system of a call replaces the client's default.** A non-empty
+  `paymentId` or `paymentCode` passed in a call leaves the `setPaymentId()` / `setPaymentCode()`
+  pair out of that request entirely. Before, the two levels were merged and the client's code beat
+  the call's id: `setPaymentCode('paddle_subscription')` plus `{ paymentId: 'balance' }` charged
+  the card. See [Paying for orders](#paying-for-orders).
+- **Behaviour change: money and write requests succeed only on `status: "success"`.** A 2xx answer
+  without the envelope (an HTML page, an empty body, `204`, truncated JSON) or an envelope with
+  another `status` and no `errors` used to be returned as the result — `orderMake()` could
+  "return" an HTML page. It now throws `Unexpected response … check before retrying`. Reads and
+  `*/calc` are parsed as before. See [Error handling](#error-handling).
+- **Money requests wait up to 120 s** (`moneyTimeout`), other requests keep `timeout` (30 s), and
+  an explicit `timeout` is a lower bound for money requests. See
+  [Timeouts and retries on payments](#timeouts-and-retries-on-payments).
+- **The API key is masked** (`***`) in every `ApiError` — message, body, errors — and in
+  `console.log(api)` / `JSON.stringify(api)`.
+- **`axios` `^1.19.0`** is the minimum supported version.
 - **Behaviour change: requests are now paced by default** (see
   [Rate limits and the request queue](#rate-limits-and-the-request-queue)). A client keeps its key
   under 1000 request starts per 60 seconds, sends write and money requests one at a time — 1 s
@@ -751,5 +861,5 @@ Changes made after the 2.0 release, in the order the server shipped them:
 ## Development
 
 ```sh
-npm test   # offline self-check of the local gates and the request queue (no network calls, fake time)
+npm test   # offline self-check: local gates, request bodies, the queue on fake time, and a few checks against a local 127.0.0.1 server
 ```

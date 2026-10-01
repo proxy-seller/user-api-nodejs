@@ -112,6 +112,170 @@ const AUTO_PROLONG_ALIASES = Object.freeze({
     tariffId: 'tarifId'
 });
 
+/////////////////////////////// API-ключ вне ошибок ///////////////////////////////
+
+/** Чем SDK заменяет API-ключ в ошибках и в представлении клиента. */
+const SECRET_MASK = '***';
+
+/**
+ * Ключ короче этого не маскируется: сервер выдаёт ключи от 12 символов, а замена одной-трёх букв
+ * изуродовала бы текст любой ошибки ("Error api key" -> "Error api ***ey") и ничего бы не скрыла.
+ */
+const SECRET_MIN_LENGTH = 4;
+
+/**
+ * Шаблоны поиска ключа, по клиенту. Ключ стоит в ПУТИ запроса, и сервер или прокси перед ним может
+ * вернуть этот путь в теле ответа — тело ошибки Spring {timestamp, status, error, path}, HTML-страница
+ * 404. Шаблон хранится вне экземпляра, чтобы его не напечатали ни console.log, ни JSON.stringify.
+ */
+const CLIENT_SECRETS = new WeakMap();
+
+/** util.inspect.custom без импорта node:util: символ берётся из общего реестра. */
+const INSPECT_CUSTOM = Symbol.for('nodejs.util.inspect.custom');
+
+/** Сколько символов тела ответа без конверта остаётся в ApiError (см. _bodySnippet()). */
+const BODY_SNIPPET_LENGTH = 500;
+
+/**
+ * Шаблон, который находит ключ в тексте: сам ключ и его URL-кодированную форму (в путь он уходит
+ * кодированным), без учёта регистра — фронтовый 404 стейджа отдаёт путь в нижнем регистре.
+ * @param {*} key
+ * @return {RegExp|null} null — ключ короче SECRET_MIN_LENGTH и не маскируется
+ */
+function secretPattern(key) {
+    const raw = String(key);
+    if (raw.length < SECRET_MIN_LENGTH) {
+        return null;
+    }
+    const forms = [...new Set([raw, encodeURIComponent(raw)])]
+        // Длинная форма первой: если одна форма — начало другой (ключ с '%'), короткая оставила бы
+        // хвост длинной.
+        .sort((a, b) => b.length - a.length)
+        .map((form) => form.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    return new RegExp(forms.join('|'), 'gi');
+}
+
+/**
+ * Копия значения, в которой ключ заменён на SECRET_MASK во всех строках — и в значениях, и в именах
+ * полей. Простые объекты и массивы копируются вглубь; байты (ArrayBuffer, Buffer, Uint8Array)
+ * маскируются, только если ключ в них есть, и тип при этом сохраняется; прочие объекты (потоки, даты,
+ * экземпляры классов) возвращаются как есть.
+ * @param {*} value
+ * @param {RegExp|null} pattern см. secretPattern()
+ * @param {Map} seen уже скопированные объекты — на случай циклов
+ * @return {*}
+ */
+function maskSecret(value, pattern, seen = new Map()) {
+    if (!pattern || value === null || value === undefined) {
+        return value;
+    }
+    if (typeof value === 'string') {
+        return value.replace(pattern, SECRET_MASK);
+    }
+    if (typeof value !== 'object') {
+        return value;
+    }
+    if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
+        return maskBytes(value, pattern);
+    }
+    if (seen.has(value)) {
+        return seen.get(value);
+    }
+    if (Array.isArray(value)) {
+        const copy = [];
+        seen.set(value, copy);
+        for (const item of value) {
+            copy.push(maskSecret(item, pattern, seen));
+        }
+        return copy;
+    }
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) {
+        return value;
+    }
+    const copy = {};
+    seen.set(value, copy);
+    for (const [name, item] of Object.entries(value)) {
+        // defineProperty, а не присваивание: поле "__proto__" из JSON иначе подменило бы прототип копии.
+        Object.defineProperty(copy, name.replace(pattern, SECRET_MASK), {
+            value: maskSecret(item, pattern, seen), enumerable: true, writable: true, configurable: true
+        });
+    }
+    return copy;
+}
+
+/**
+ * maskSecret() для байтов: без ключа внутри — то же значение, с ключом — маскированная копия того же
+ * типа (Buffer остаётся Buffer, ArrayBuffer — ArrayBuffer).
+ * @param {ArrayBuffer|ArrayBufferView} value
+ * @param {RegExp} pattern
+ * @return {ArrayBuffer|ArrayBufferView}
+ */
+function maskBytes(value, pattern) {
+    const text = new TextDecoder().decode(asBytes(value));
+    if (text.search(pattern) === -1) {
+        return value;
+    }
+    const masked = new TextEncoder().encode(text.replace(pattern, SECRET_MASK));
+    if (typeof Buffer !== 'undefined' && Buffer.isBuffer(value)) {
+        return Buffer.from(masked.buffer, masked.byteOffset, masked.byteLength);
+    }
+    return value instanceof ArrayBuffer ? masked.buffer : masked;
+}
+
+/**
+ * @param {ArrayBuffer|ArrayBufferView} value
+ * @return {Uint8Array} те же байты, без копирования
+ */
+function asBytes(value) {
+    return value instanceof ArrayBuffer
+        ? new Uint8Array(value)
+        : new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+}
+
+/////////////////////////////// Таймауты ///////////////////////////////
+
+/** Общий таймаут запроса по умолчанию, мс. */
+const DEFAULT_TIMEOUT_MS = 30000;
+
+/**
+ * Таймаут денежных запросов (категория money: order/make, prolong/make/{type}, balance/add) по
+ * умолчанию, мс. Сервер собирает заказ синхронно — большой MIX идёт дольше 30 с, — и общий таймаут
+ * обрывал бы уже оплаченный заказ: клиент видел бы ошибку, а повтор купил бы то же самое второй раз.
+ */
+const DEFAULT_MONEY_TIMEOUT_MS = 120000;
+
+/** Самый длинный таймаут, который выдерживают таймеры Node (2^31 - 1 мс). */
+const TIMEOUT_MAX_MS = 2147483647;
+
+/**
+ * Таймаут денежных запросов из config конструктора.
+ *
+ * moneyTimeout не задан (undefined / null) — 120 с. Если явно задан общий timeout, денежные запросы
+ * ждут не меньше его: max(timeout, moneyTimeout). 0, как у axios, — без таймаута, то есть «дольше»
+ * любого числа.
+ * @param {*} moneyTimeout config.moneyTimeout
+ * @param {*} timeout config.timeout как передан: undefined — не задан
+ * @return {number} мс; 0 — без таймаута
+ * @throws ApiError при неверном moneyTimeout
+ */
+function resolveMoneyTimeout(moneyTimeout, timeout) {
+    const money = moneyTimeout === undefined || moneyTimeout === null ? DEFAULT_MONEY_TIMEOUT_MS : moneyTimeout;
+    if (typeof money !== 'number' || !Number.isFinite(money) || money < 0 || money > TIMEOUT_MAX_MS) {
+        throw new ApiError(
+            `moneyTimeout must be a number of milliseconds from 0 to ${TIMEOUT_MAX_MS} (0 = no timeout)`
+        );
+    }
+    if (typeof timeout !== 'number' || !Number.isFinite(timeout) || timeout < 0) {
+        // Общий таймаут не задан — или задан так, что его разбирает axios: денежным хватает своего.
+        return money;
+    }
+    if (money === 0 || timeout === 0) {
+        return 0;
+    }
+    return Math.max(money, timeout);
+}
+
 /////////////////////////////// Очередь запросов ///////////////////////////////
 
 /**
@@ -145,7 +309,8 @@ const RETRY_AFTER_CAP_MS = 60000;
  * Категории запросов для очереди — по ПУТИ, не по HTTP-методу: calc-эндпоинты шлются POST, но
  * ничего не меняют. `{type}` совпадает с любым одним сегментом пути; пути, которого здесь нет, —
  * read. Это единственное место, где записана классификация: request() берёт категорию только
- * отсюда, через _requestCategory().
+ * отсюда, через _requestCategory(), и по ней же выбирает таймаут (money — moneyTimeout) и
+ * строгость разбора ответа (money и write — успех только по status="success").
  *   money — деньги: заказ, продление, пополнение баланса;
  *   write — меняют состояние аккаунта;
  *   read  — всё остальное: списки, get, calc, справочники, выгрузки, статистика.
@@ -452,6 +617,16 @@ class ProxySellerUserApi {
      * берёт значение по умолчанию, false — то же, что { enabled: false }: запросы уходят сразу и без
      * повторов, как до появления очереди. Для тестов с фальшивым временем — now() (мс, монотонные
      * часы) и sleep(ms) → Promise. В axios rateLimit не передаётся.
+     *
+     * config.timeout — общий таймаут запроса, мс: 30000 по умолчанию, 0 — без таймаута.
+     * config.moneyTimeout — таймаут денежных запросов (order/make, prolong/make/{type}, balance/add),
+     * мс: 120000 по умолчанию, 0 — без таймаута. Если общий timeout задан явно, денежные запросы ждут
+     * max(timeout, moneyTimeout). Обрыв по таймауту не отменяет запрос на сервере: заказ мог быть
+     * создан и оплачен (раздел README «Timeouts and retries on payments»). В axios moneyTimeout не
+     * передаётся.
+     *
+     * Ключ не печатается: console.log(api) и JSON.stringify(api) показывают baseURL с маской вместо
+     * ключа (см. toJSON()), а в ошибках SDK ключ заменён на *** (см. _apiError()).
      * @param {*} config
      * @throws ApiError
      */
@@ -466,7 +641,8 @@ class ProxySellerUserApi {
             key,
             baseUrl,
             baseURL,
-            timeout = 30000,
+            timeout = DEFAULT_TIMEOUT_MS,
+            moneyTimeout,
             headers = {},
             fingerprint = null,
             rateLimit,
@@ -475,7 +651,10 @@ class ProxySellerUserApi {
         const apiRoot = String(baseUrl || baseURL || this.URL).replace(/\/+$/, '') + '/';
 
         this.baseURL = apiRoot + encodeURIComponent(key) + '/';
+        CLIENT_SECRETS.set(this, secretPattern(key));
         this.timeout = timeout;
+        // config.timeout, а не timeout: max() берётся, только если общий таймаут задан ЯВНО.
+        this.moneyTimeout = resolveMoneyTimeout(moneyTimeout, config.timeout);
         this.setFingerprint(fingerprint);
         // Состояние очереди — в экземпляре, то есть на один ключ в одном процессе.
         this.requestQueue = createRequestQueue(rateLimit);
@@ -499,6 +678,10 @@ class ProxySellerUserApi {
      * balance itself is never listed. For orders and renewals prefer setPaymentCode('balance') /
      * setPaymentCode('paddle_subscription'); a code passed here works too — the server retries
      * the value as a code when it is not a valid id.
+     *
+     * Это значение клиента ПО УМОЛЧАНИЮ: платёжка, переданная в самом вызове (paymentId или
+     * paymentCode в options либо в объектной форме), главнее — тогда пара клиента в запрос не
+     * попадает вовсе, ни id, ни code (см. _paymentLevel()).
      * @param string id
      */
     setPaymentId(id) {
@@ -514,6 +697,8 @@ class ProxySellerUserApi {
      * balance) or `paddle_subscription` (the card saved on the account) — the only two they
      * accept, since a one-off checkout ends on a hosted page a headless client cannot complete.
      * balance/add does not resolve codes and needs setPaymentId().
+     *
+     * Как и setPaymentId(), это значение по умолчанию: платёжка вызова его вытесняет целиком.
      */
     setPaymentCode(code) {
         this.paymentCode = code
@@ -561,6 +746,47 @@ class ProxySellerUserApi {
     }
 
     /**
+     * Что попадает в JSON.stringify(api): настройки клиента, baseURL — с маской на месте ключа. Ключ
+     * стоит в пути baseURL, и без этого метода его печатал бы любой логгер, сериализующий объект.
+     * @return {object}
+     */
+    toJSON() {
+        const queue = this.requestQueue;
+        return {
+            baseURL: String(this.baseURL).replace(/[^/]+\/?$/, `${SECRET_MASK}/`),
+            timeout: this.timeout,
+            moneyTimeout: this.moneyTimeout,
+            paymentId: this.paymentId,
+            paymentCode: this.paymentCode,
+            generateAuth: this.generateAuth,
+            fingerprint: this.fingerprint,
+            rateLimit: queue
+                ? {
+                    requestsPerMinute: queue.requestsPerMinute,
+                    writeIntervalMs: queue.writeIntervalMs,
+                    moneyIntervalMs: queue.moneyIntervalMs,
+                    maxRetries: queue.maxRetries
+                }
+                : false
+        };
+    }
+
+    /**
+     * Что печатают console.log(api) и util.inspect(api): то же, что toJSON(), — без ключа и без
+     * axios-инстанса, в defaults которого тоже лежит baseURL с ключом.
+     */
+    [INSPECT_CUSTOM](depth, options, inspect) {
+        if (typeof inspect !== 'function') {
+            return this.toJSON();
+        }
+        if (depth < 0) {
+            return '[ProxySellerUserApi]';
+        }
+        const nested = { ...options, depth: options.depth == null ? options.depth : options.depth - 1 };
+        return `ProxySellerUserApi ${inspect(this.toJSON(), nested)}`;
+    }
+
+    /**
      * Send request into server
      *
      * Единственное место, где SDK отправляет HTTP-запросы, и в него же встроена очередь запросов
@@ -571,16 +797,29 @@ class ProxySellerUserApi {
      * options.headers кладутся ПОВЕРХ заголовков клиента (axios мержит их с дефолтами
      * инстанса), не заменяя их: так order/make добавляет X-Fingerprint, не трогая
      * Content-Type и то, что передали в конструктор.
+     *
+     * По категории пути (_requestCategory) решаются ещё две вещи:
+     *   - money получает свой таймаут — moneyTimeout конструктора; timeout в options главнее;
+     *   - money и write считаются успешными, ТОЛЬКО если пришёл конверт со status="success".
+     *     Ответ без конверта (HTML, пустое тело, 204, обрезанный JSON, не-объект) и конверт со
+     *     status не "success" без errors — ApiError "Unexpected response …" (_unexpectedResponse()).
+     *     read (а с ним и все calc) разбирается как раньше: status="error" с заполненным data и
+     *     пустым errors[] — это нехватка средств у prolong/calc и autoprolong/calc, её data
+     *     возвращается.
+     * Все ApiError отсюда — без API-ключа (_apiError()).
      * @param string method
      * @param string uri
      * @param {*} options
      * @return mixed
-     * @throws Error
+     * @throws ApiError
      */
     async request(method, uri, options = {}) {
         const { method: ignoredMethod, url: ignoredUrl, baseURL: ignoredBaseURL, ...requestOptions } = options;
+        const category = this._requestCategory(uri);
         // Функция, а не готовый промис: очередь зовёт её на каждую попытку, в том числе на повтор 429.
         const send = () => this.client.request({
+            // Денежному запросу — свой таймаут, остальным — общий из axios.create().
+            ...(category === 'money' ? { timeout: this.moneyTimeout } : {}),
             ...requestOptions,
             method: method,
             url: uri
@@ -588,10 +827,12 @@ class ProxySellerUserApi {
         let response;
         try {
             response = this.requestQueue
-                ? await this.requestQueue.run(this._requestCategory(uri), send)
+                ? await this.requestQueue.run(category, send)
                 : await send();
         } catch (error) {
-            throw new ApiError(error?.message || 'Client API request failed', {
+            // Сырой axios error наружу не уходит — ни сам, ни как cause: в его config лежит baseURL,
+            // то есть ключ. Переносим текст, код и ответ, и всё это — без ключа.
+            throw this._apiError(error?.message || 'Client API request failed', {
                 code: error?.code ?? null,
                 httpStatus: error?.response?.status ?? null,
                 body: error?.response?.data ?? null
@@ -602,6 +843,9 @@ class ProxySellerUserApi {
             response.headers?.['content-type'],
             response.headers?.['content-disposition']
         );
+        // money и write: что запрос сделал, видно только по конверту, а без него не понять даже,
+        // выполнился ли он. Такой ответ — не успех.
+        const strict = category === 'money' || category === 'write';
 
         if (data && typeof data === 'object' && !this.isBinary(data)) {
             const isEnvelope = Object.prototype.hasOwnProperty.call(data, 'status') &&
@@ -618,13 +862,17 @@ class ProxySellerUserApi {
                     // и реальная причина (IP / лимит) видна только по остальным.
                     throw this.toApiError(data.errors[0], response.status, data, data.errors);
                 }
+                if (strict) {
+                    throw this._unexpectedResponse(uri, response.status,
+                        `status ${JSON.stringify(data.status)} without errors`, data);
+                }
                 // Calculation warnings and insufficient-funds responses intentionally use
                 // status=error, errors=[], and put useful calculation details in data.
                 if (response.status >= 200 && response.status < 300 &&
                     data.data !== undefined && data.data !== null) {
                     return data.data;
                 }
-                throw new ApiError('Client API returned an error', {
+                throw this._apiError('Client API returned an error', {
                     httpStatus: response.status,
                     body: data
                 });
@@ -634,18 +882,93 @@ class ProxySellerUserApi {
                 throw this.toApiError(data, response.status, data);
             }
         } else if (response.status < 200 || response.status >= 300) {
-            throw new ApiError(`Client API HTTP ${response.status}`, {
+            throw this._apiError(`Client API HTTP ${response.status}`, {
                 httpStatus: response.status,
                 body: data
             });
         }
 
+        if (strict) {
+            throw this._unexpectedResponse(uri, response.status, 'no JSON envelope', this._bodySnippet(data));
+        }
         return data;
     }
 
     /**
-     * Категория запроса для очереди — money | write | read — по пути из REQUEST_CATEGORIES, а не
-     * по HTTP-методу. Путь сравнивается посегментно, без query-строки, лишних слэшей и регистра;
+     * Ошибка на ответ money/write без успешного конверта. Раньше такой ответ возвращался как успех:
+     * order/make «возвращал» HTML-страницу или пустую строку, и интегратор считал заказ созданным
+     * (или, наоборот, не созданным) наугад. По такому ответу не понять, выполнился ли запрос, поэтому
+     * текст говорит прямо: мог выполниться, проверьте до повтора.
+     * @param {string} uri путь запроса — без ключа, он в baseURL
+     * @param {number} httpStatus
+     * @param {string} what что не так с ответом
+     * @param {*} body что положить в error.body: конверт либо начало тела (_bodySnippet())
+     * @return {ApiError}
+     */
+    _unexpectedResponse(uri, httpStatus, what, body) {
+        const path = String(uri == null ? '' : uri).split(/[?#]/, 1)[0];
+        return this._apiError(
+            `Unexpected response from ${path} (HTTP ${httpStatus}, ${what}); ` +
+            'the request may have been executed — check before retrying',
+            { httpStatus: httpStatus, body: body }
+        );
+    }
+
+    /**
+     * Начало тела ответа без конверта — для error.body: текстом, без ключа, не длиннее
+     * BODY_SNIPPET_LENGTH символов. Ключ маскируется ДО обрезки, чтобы обрезка не оставила его часть.
+     * @param {*} data тело после normalizeResponseData()
+     * @return {string}
+     */
+    _bodySnippet(data) {
+        let text;
+        if (data === undefined || data === null) {
+            text = '';
+        } else if (typeof data === 'string') {
+            text = data;
+        } else if (this.isBinary(data)) {
+            text = new TextDecoder().decode(asBytes(data));
+        } else {
+            try {
+                text = JSON.stringify(data) ?? String(data);
+            } catch (_) {
+                text = String(data);
+            }
+        }
+        text = this._maskSecret(text);
+        return text.length > BODY_SNIPPET_LENGTH ? text.slice(0, BODY_SNIPPET_LENGTH) + '…' : text;
+    }
+
+    /**
+     * Значение без API-ключа этого клиента — см. maskSecret().
+     * @param {*} value
+     * @return {*}
+     */
+    _maskSecret(value) {
+        return maskSecret(value, CLIENT_SECRETS.get(this) || null);
+    }
+
+    /**
+     * ApiError, в которой нет API-ключа: ни в message, ни в body / errors / customData. Ключ стоит в
+     * пути запроса, а путь возвращают тела ошибок (Spring {timestamp, status, error, path}, HTML-страница
+     * 404 фронта — та в нижнем регистре), так что маскируются точное написание, URL-кодированное и
+     * любой регистр. Все ошибки, которые request() строит из ответа или из сбоя транспорта, идут
+     * через этот метод.
+     * @param {*} message
+     * @param {object} fields поля ApiError: code, customData, httpStatus, body, errors
+     * @return {ApiError}
+     */
+    _apiError(message, fields = {}) {
+        const masked = {};
+        for (const [name, value] of Object.entries(fields)) {
+            masked[name] = this._maskSecret(value);
+        }
+        return new ApiError(this._maskSecret(message), masked);
+    }
+
+    /**
+     * Категория запроса для очереди, таймаута и разбора ответа — money | write | read — по пути из
+     * REQUEST_CATEGORIES, а не по HTTP-методу. Путь сравнивается посегментно, без query-строки, лишних слэшей и регистра;
      * `{type}` — любой один сегмент. Чего нет в таблице, то read.
      * @param {string} uri путь относительно корня API — тот, что получает request()
      * @return {string}
@@ -659,9 +982,18 @@ class ProxySellerUserApi {
         return match ? match.category : 'read';
     }
 
+    /**
+     * ApiError из элемента errors[] конверта либо из тела ответа без конверта (например, тела ошибки
+     * Spring {timestamp, status, error, path} — его path несёт ключ). Ключ маскируется (_apiError()).
+     * @param {*} error элемент errors[] или тело ответа
+     * @param {number} httpStatus
+     * @param {*} body
+     * @param {array} errors весь массив errors; по умолчанию — [error]
+     * @return {ApiError}
+     */
     toApiError(error, httpStatus, body, errors = null) {
         const item = error && typeof error === 'object' ? error : {};
-        return new ApiError(item.message || item.error || `Client API HTTP ${httpStatus}`, {
+        return this._apiError(item.message || item.error || `Client API HTTP ${httpStatus}`, {
             code: item.code ?? null,
             customData: item.customData ?? item.custom_data ?? null,
             httpStatus: httpStatus,
@@ -722,10 +1054,35 @@ class ProxySellerUserApi {
         );
     }
 
+    /**
+     * Пара платёжки КЛИЕНТА (setPaymentId / setPaymentCode): prepare*-хелперы кладут её в тело
+     * первой, а платёжка вызова её затем вытесняет целиком — см. _paymentLevel().
+     * @return {{paymentCode: *}|{paymentId: *}}
+     */
     paymentOptions() {
         return this.getPaymentCode()
             ? { paymentCode: this.getPaymentCode() }
             : { paymentId: this.getPaymentId() };
+    }
+
+    /**
+     * Платёжка запроса — пара paymentId / paymentCode РОВНО одного уровня. Платёжка вызова главнее
+     * платёжки клиента: если в вызове (options или объектная форма) задана непустая половина пары,
+     * пара клиента в запрос не попадает вовсе — ни id, ни code. Только когда в вызове нет ни той, ни
+     * другой, берётся пара клиента, и пустые значения вызова ('' / null) её не стирают. Внутри уровня
+     * старшинство прежнее — code старше id (ORDER_REFERENCE_PAIRS, PROLONG_REFERENCE_PAIRS).
+     *
+     * Раньше уровни смешивались: setPaymentCode('paddle_subscription') и { paymentId: 'balance' } в
+     * вызове давали тело с обеими половинами, code был старше — и заказ, который вызов просил оплатить
+     * с баланса, списывался с карты.
+     * @param {object} base пара клиента — тело до мержа полей вызова (её положил paymentOptions())
+     * @param {object} values поля вызова
+     * @return {{paymentId: *, paymentCode: *}}
+     */
+    _paymentLevel(base, values) {
+        const filled = (v) => v != null && String(v).trim() !== '';
+        const level = filled(values.paymentId) || filled(values.paymentCode) ? values : base;
+        return { paymentId: level.paymentId, paymentCode: level.paymentCode };
     }
 
     /**
@@ -745,6 +1102,9 @@ class ProxySellerUserApi {
      * Когда заполнены обе половины пары, лишняя убирается по ПРИОРИТЕТУ СЕРВЕРА
      * (ORDER_REFERENCE_PAIRS): payment/country/period резолвятся от кода, а
      * operator/rotation/mix/tarif — от идентификатора.
+     *
+     * Платёжка не мержится по полям: пара вызова вытесняет пару клиента из payload целиком
+     * (_paymentLevel()), и только потом внутри пары code старше id.
      */
     mergeOrderOptions(payload, options = {}) {
         const allowed = [
@@ -756,11 +1116,14 @@ class ProxySellerUserApi {
         const values = options && typeof options === 'object' && !Array.isArray(options)
             ? options
             : {};
+        // Выбираем до мержа: сейчас в payload лежит пара клиента.
+        const payment = this._paymentLevel(payload, values);
         for (const key of allowed) {
             if (Object.prototype.hasOwnProperty.call(values, key)) {
                 payload[key] = values[key];
             }
         }
+        Object.assign(payload, payment);
 
         return this.filterEmpty(this._resolveReferencePairs(payload, ORDER_REFERENCE_PAIRS));
     }
@@ -886,6 +1249,11 @@ class ProxySellerUserApi {
      * эндпоинта — лишь `summ` и `paymentId`, а резолва кодов, который работает в order/* и
      * prolong/*, здесь нет. setPaymentCode() на этот эндпоинт не влияет.
      *
+     * Платёжка вызова главнее платёжки клиента (см. _paymentLevel()): непустой paymentId или
+     * paymentCode вызова вытесняет setPaymentId() / setPaymentCode() целиком. Поэтому
+     * { paymentCode } в вызове — локальная ApiError, даже если у клиента задан paymentId: молча
+     * пополнить баланс другой системой, чем просил вызов, хуже, чем отказать.
+     *
      * @param {number} summ сумма пополнения (минимум задаётся на сервере, по умолчанию > 1)
      * @param {string|{paymentId?: string, paymentCode?: string}} paymentId ObjectId платёжной системы
      * @return {Promise<string>} ссылка на страницу оплаты
@@ -895,15 +1263,18 @@ class ProxySellerUserApi {
         const asObject = paymentId && typeof paymentId === 'object' && !Array.isArray(paymentId)
             ? paymentId
             : null;
-        const explicitId = asObject ? asObject.paymentId : paymentId;
-        const explicitCode = asObject ? asObject.paymentCode : null;
-        const effectiveId = explicitId ?? this.getPaymentId();
+        const call = asObject
+            ? { paymentId: asObject.paymentId, paymentCode: asObject.paymentCode }
+            : { paymentId: paymentId };
+        const payment = this._paymentLevel(
+            { paymentId: this.getPaymentId(), paymentCode: this.getPaymentCode() }, call
+        );
+        const filled = (v) => v != null && String(v).trim() !== '';
 
-        if (effectiveId == null || String(effectiveId).trim() === '') {
-            const code = explicitCode ?? this.getPaymentCode();
-            if (code != null && String(code).trim() !== '') {
+        if (!filled(payment.paymentId)) {
+            if (filled(payment.paymentCode)) {
                 throw new ApiError(
-                    `balance/add does not resolve paymentCode ("${code}"): the endpoint accepts only ` +
+                    `balance/add does not resolve paymentCode ("${payment.paymentCode}"): the endpoint accepts only ` +
                     'paymentId (an ObjectId from balancePaymentsList()). Pick the item you need there ' +
                     'and pass its id as paymentId / setPaymentId().'
                 );
@@ -915,7 +1286,7 @@ class ProxySellerUserApi {
         }
 
         return (await this.request('post', 'balance/add', {
-            data: { summ: summ, paymentId: effectiveId }
+            data: { summ: summ, paymentId: payment.paymentId }
         })).url;
     }
 
@@ -1665,11 +2036,14 @@ class ProxySellerUserApi {
                 periodId: periodId,
                 coupon: coupon
             };
+        // Платёжка вызова вытесняет пару клиента целиком — см. _paymentLevel().
+        const payment = this._paymentLevel(payload, values);
         for (const key of PROLONG_BODY_FIELDS) {
             if (Object.prototype.hasOwnProperty.call(values, key)) {
                 payload[key] = values[key];
             }
         }
+        Object.assign(payload, payment);
         for (const key of PROLONG_SELECTION_FIELDS) {
             const list = this._prolongList(payload[key]);
             if (list.length) {

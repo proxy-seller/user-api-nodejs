@@ -4,9 +4,16 @@
  * Ни один кейс не ходит в интернет: проверки либо синхронные, либо падают до отправки
  * запроса, либо подменяют request(), либо — для очереди — подменяют транспорт (adapter
  * axios) и крутят виртуальное время, так что ни одна пауза очереди не ждётся по-настоящему.
+ * Несколько проверок (ключ в ошибках транспорта, таймауты) идут через настоящий axios в
+ * локальный HTTP-сервер на 127.0.0.1 либо в закрытый порт там же.
  *
  * Запуск: npm test
  */
+import fs from 'node:fs';
+import http from 'node:http';
+import net from 'node:net';
+import util from 'node:util';
+import axios from 'axios';
 import ProxySellerUserApi, { ApiError, PROXY_REPLACE_TYPES } from '../index.js';
 
 let passed = 0;
@@ -1505,6 +1512,560 @@ await check('rate limit: неверная конфигурация — ApiError 
         'an omitted option keeps its default');
     assertEqual(configured.client.defaults.rateLimit, undefined, 'rateLimit must not reach axios');
     assert(new ProxySellerUserApi({ key: 'k', rateLimit: true }).requestQueue !== null, 'true = defaults');
+});
+
+/////////////////////////////// платёжка вызова главнее платёжки клиента ///////////////////////////////
+
+// setPaymentId / setPaymentCode — значение клиента по умолчанию. Непустой paymentId ИЛИ paymentCode
+// в самом вызове вытесняет пару клиента целиком: ни id, ни code клиента в тело не попадают. Раньше
+// уровни смешивались, и code клиента (старший в паре) вытеснял id вызова — заказ, который вызов
+// просил оплатить с баланса, уходил на карту.
+
+/** Тела, ушедшие через подменённый транспорт: настоящий request() и axios, без сети. */
+function wireBodies(transport) {
+    return transport.log.map((entry) => ({ url: entry.url, body: JSON.parse(entry.data) }));
+}
+
+await check('платёжка: paymentId вызова вытесняет paymentCode клиента во всех обёртках order/prolong/autoprolong', async () => {
+    const client = new ProxySellerUserApi({ key: 'k' });
+    client.setPaymentCode('paddle_subscription');
+    const byCall = { paymentId: 'balance' };
+    const calls = await captureRequest(client, async () => {
+        await client.orderCalcIpv4('USA', '1m', 1, null, null, 'scraping', byCall);
+        await client.orderMakeIpv4('USA', '1m', 1, null, null, 'scraping', byCall);
+        await client.orderMakeIsp({ countryId: 'USA', periodId: '1m', quantity: 1, customTargetName: 'scraping', paymentId: 'balance' });
+        await client.orderMakeMix('europe-2-mix_IPv4', '1m', 1, null, null, null, byCall);
+        await client.orderMakeMixByCode('europe-2-mix_IPv4', '1m', 1, byCall);
+        await client.orderMakeIpv6('USA', '1m', 1, null, null, 'scraping', 'HTTPS', byCall);
+        // options на месте mobileServiceType и на своём месте
+        await client.orderMakeMobile('USA', '1m', 1, null, null, 'OPERATOR_ID', 5, byCall);
+        await client.orderCalcMobile('USA', '1m', 1, null, null, 'OPERATOR_ID', 5, 'shared', byCall);
+        await client.orderCalcResident('1-gb', null, byCall);
+        await client.orderMakeResident({ tarifId: '1-gb', paymentId: 'balance' });
+        await client.prolongCalc('ipv4', [ADDRESS], '1m', '', byCall);
+        await client.prolongMake('ipv6', { orderIds: [ORDER_ID], periodId: '1m', paymentId: 'balance' });
+        await client.autoProlongCalc('ipv4', [PROXY_ID], '1m', byCall);
+        await client.autoProlongEnable('resident', null, null, { payment_id: 'balance' });
+    });
+    assertEqual(calls.length, 14, 'every call must be sent');
+    for (const call of calls) {
+        assertEqual(call.options.data.paymentId, 'balance', `${call.uri}: the call's paymentId lost`);
+        assert(!('paymentCode' in call.options.data),
+            `${call.uri}: the client's paymentCode must not be sent, got ${JSON.stringify(call.options.data)}`);
+    }
+});
+
+await check('платёжка: paymentCode вызова вытесняет paymentId клиента; на проводе — только пара вызова', async () => {
+    const time = virtualTime();
+    const transport = stubTransport(time);
+    const { client } = pacedClient(time, transport);
+    client.setPaymentId('balance');
+    const byCall = { paymentCode: 'paddle_subscription' };
+    await time.run(async () => {
+        await client.orderMakeIpv4('USA', '1m', 1, null, null, 'scraping', byCall);
+        await client.orderMakeResident('1-gb', null, byCall);
+        await client.prolongMake('ipv4', [ADDRESS], '1m', '', byCall);
+        await client.autoProlongEnable('ipv6', [ORDER_ID], '1m', byCall);
+    });
+    const bodies = wireBodies(transport);
+    assertEqual(bodies.length, 4, 'every call must be sent');
+    for (const { url, body } of bodies) {
+        assertEqual(body.paymentCode, 'paddle_subscription', `${url}: the call's paymentCode lost`);
+        assert(!('paymentId' in body), `${url}: the client's paymentId must not be sent, got ${JSON.stringify(body)}`);
+    }
+
+    // И обратно, на проводе: код клиента + id вызова.
+    const time2 = virtualTime();
+    const transport2 = stubTransport(time2);
+    const { client: client2 } = pacedClient(time2, transport2);
+    client2.setPaymentCode('paddle_subscription');
+    await time2.run(() => client2.orderMakeIpv4('USA', '1m', 1, null, null, 'scraping', { paymentId: 'balance' }));
+    const [{ body }] = wireBodies(transport2);
+    assertEqual([body.paymentId, 'paymentCode' in body], ['balance', false], 'order/make on the wire');
+});
+
+await check('платёжка: без платёжки в вызове берётся пара клиента, пустые значения вызова её не стирают', async () => {
+    const client = new ProxySellerUserApi({ key: 'k' });
+    client.setPaymentCode('paddle_subscription');
+    const calls = await captureRequest(client, async () => {
+        await client.orderMakeResident('1-gb');
+        await client.orderMakeResident('1-gb', null, { paymentId: '', paymentCode: null });
+        await client.orderMakeIpv4({ countryId: 'USA', periodId: '1m', customTargetName: 'scraping', paymentCode: '   ' });
+        await client.prolongMake('ipv4', [ADDRESS], '1m', '', { paymentCode: '' });
+        await client.autoProlongEnable('ipv4', [PROXY_ID], '1m', { paymentId: null });
+    });
+    assertEqual(calls.length, 5, 'every call must be sent');
+    for (const call of calls) {
+        assertEqual(call.options.data.paymentCode, 'paddle_subscription', `${call.uri}: the client's paymentCode lost`);
+        assert(!('paymentId' in call.options.data), `${call.uri}: no paymentId expected, got ${JSON.stringify(call.options.data)}`);
+    }
+
+    const byId = new ProxySellerUserApi({ key: 'k' });
+    byId.setPaymentId('PAYMENT_OBJECT_ID');
+    assertBody(byId.prepareProlong('ipv4', [ADDRESS], '1m', '', { paymentCode: '', paymentId: undefined }),
+        { paymentId: 'PAYMENT_OBJECT_ID', ips: [ADDRESS], periodId: '1m', coupon: '' }, 'client paymentId must survive');
+});
+
+await check('платёжка: внутри одного уровня code по-прежнему старше id', () => {
+    const client = new ProxySellerUserApi({ key: 'k' });
+    client.setPaymentId('CLIENT_ID');
+    const order = client.prepareResident('1-gb', null, { paymentId: 'CALL_ID', paymentCode: 'balance' });
+    assertBody(order, { paymentCode: 'balance', sectionCode: 'resident', tarifId: '1-gb' }, 'order: call level');
+    const prolong = client.prepareProlong('ipv4', [ADDRESS], '1m', '', { paymentId: 'CALL_ID', paymentCode: 'balance' });
+    assertBody(prolong, { paymentCode: 'balance', ips: [ADDRESS], periodId: '1m', coupon: '' }, 'prolong: call level');
+    // Пустой code вызова не прячет его id: заполнена одна половина — значит, уровень вызова.
+    const halfEmpty = client.prepareResident('1-gb', null, { paymentId: 'CALL_ID', paymentCode: '' });
+    assertBody(halfEmpty, { paymentId: 'CALL_ID', sectionCode: 'resident', tarifId: '1-gb' }, 'order: call id with an empty code');
+
+    const both = new ProxySellerUserApi({ key: 'k' });
+    both.setPaymentId('CLIENT_ID');
+    both.setPaymentCode('balance');
+    assertBody(both.prepareResident('1-gb'), { paymentCode: 'balance', sectionCode: 'resident', tarifId: '1-gb' },
+        'client level: code beats id');
+});
+
+await check('balanceAdd: платёжка вызова главнее клиентской; code вызова не подменяется id клиента', async () => {
+    const client = new ProxySellerUserApi({ key: 'k' });
+    client.setPaymentId('CLIENT_PAYMENT_ID');
+    const calls = await captureRequest(client, async () => {
+        await expectApiError(() => client.balanceAdd(10, { paymentCode: 'cryptomus' }),
+            'does not resolve paymentCode ("cryptomus")');
+        await client.balanceAdd(10, 'CALL_PAYMENT_ID');
+        await client.balanceAdd(10, { paymentId: 'CALL_PAYMENT_ID', paymentCode: 'cryptomus' });
+        await client.balanceAdd(10, '');
+        await client.balanceAdd(10, { paymentId: null });
+        await client.balanceAdd(10);
+    }, { url: 'https://pay.example/1' });
+    assertEqual(calls.map((call) => call.options.data.paymentId),
+        ['CALL_PAYMENT_ID', 'CALL_PAYMENT_ID', 'CLIENT_PAYMENT_ID', 'CLIENT_PAYMENT_ID', 'CLIENT_PAYMENT_ID'],
+        'the paymentId sent by each call');
+
+    const byCode = new ProxySellerUserApi({ key: 'k' });
+    byCode.setPaymentCode('balance');
+    const sent = await captureRequest(byCode, () => byCode.balanceAdd(10, 'CALL_PAYMENT_ID'), { url: 'u' });
+    assertBody(sent[0].options.data, { summ: 10, paymentId: 'CALL_PAYMENT_ID' }, 'call id with a client code');
+});
+
+await check('платёжка: общий клиент — платёжка в вызове не зависит от setPaymentCode() соседнего потока', async () => {
+    const time = virtualTime();
+    const transport = stubTransport(time, () => ({ latency: 50 }));
+    const { client } = pacedClient(time, transport);
+    // Каждый поток платит своим paymentId (сервер принимает в нём и код), а соседний тем временем
+    // переключает умолчание клиента: раньше его paymentCode, старший в паре, вытеснял id вызова.
+    const flow = async (paymentId, target) => {
+        client.setPaymentCode(paymentId === 'balance' ? 'paddle_subscription' : 'balance');
+        await client.orderCalcIpv4('USA', '1m', 1, null, null, target, { paymentId: paymentId });
+        return client.orderMakeIpv4('USA', '1m', 1, null, null, target, { paymentId: paymentId });
+    };
+    await time.run(() => Promise.all([flow('paddle_subscription', 'card-flow'), flow('balance', 'balance-flow')]));
+    const made = wireBodies(transport).filter(({ url }) => url === 'order/make').map(({ body }) => body);
+    assertEqual(made.length, 2, 'both orders');
+    for (const body of made) {
+        assertEqual([body.paymentId, 'paymentCode' in body],
+            [body.customTargetName === 'card-flow' ? 'paddle_subscription' : 'balance', false],
+            `${body.customTargetName} paid with somebody else's payment system`);
+    }
+});
+
+/////////////////////////////// API-ключ не попадает в ошибки ///////////////////////////////
+
+// Ключ стоит в ПУТИ запроса, и тела ошибок его возвращают: Spring {timestamp, status, error, path},
+// HTML-страница 404 фронта (в нижнем регистре). Ни одна ошибка SDK не должна нести ключ — ни в
+// message, ни в body / errors / customData, ни в String(), ни в JSON, ни в util.inspect, ни в cause.
+
+/** Реалистичный ключ (как у сервера — 12 символов) и ключ, у которого URL-кодированная форма другая. */
+const SECRET_KEYS = ['Fq7Lm2Zx9Kp4', 'Ab/Cd+Ef 12=%'];
+
+function assertNoSecret(secret, error, label) {
+    const forms = [secret, encodeURIComponent(secret)].map((form) => form.toLowerCase());
+    const views = {
+        message: error.message,
+        'String(error)': String(error),
+        stack: error.stack,
+        'JSON.stringify(error)': JSON.stringify(error),
+        'util.inspect(error)': util.inspect(error, { depth: 10 }),
+        'JSON.stringify(error.body)': JSON.stringify(error.body ?? null),
+        'error.errors': JSON.stringify(error.errors),
+        'error.customData': JSON.stringify(error.customData ?? null),
+        'error.cause': util.inspect(error.cause, { depth: 10 })
+    };
+    for (const [name, text] of Object.entries(views)) {
+        const lower = String(text).toLowerCase();
+        for (const form of forms) {
+            assert(!lower.includes(form), `${label}: the key leaks in ${name}: ${text}`);
+        }
+    }
+}
+
+/** Ошибка, которой отклонился вызов; успех — провал проверки. */
+async function caught(fn) {
+    try {
+        await fn();
+    } catch (error) {
+        return error;
+    }
+    throw new Error('expected an error, the call succeeded');
+}
+
+/** Локальный HTTP-сервер на 127.0.0.1: handler(req, res, body) отвечает как угодно. */
+async function loopbackServer(handler) {
+    const sockets = new Set();
+    const server = http.createServer((req, res) => {
+        const chunks = [];
+        req.on('data', (chunk) => chunks.push(chunk));
+        req.on('end', () => handler(req, res, Buffer.concat(chunks).toString('utf8')));
+    });
+    server.on('connection', (socket) => {
+        sockets.add(socket);
+        socket.on('close', () => sockets.delete(socket));
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    return {
+        url: `http://127.0.0.1:${server.address().port}/personal/api/v2/`,
+        close: () => new Promise((resolve) => {
+            for (const socket of sockets) {
+                socket.destroy();
+            }
+            server.close(() => resolve());
+        })
+    };
+}
+
+/** Порт на 127.0.0.1, который только что был занят и закрыт: соединение с ним отклоняется. */
+async function closedPort() {
+    const server = net.createServer();
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+    await new Promise((resolve) => server.close(resolve));
+    return port;
+}
+
+await check('ключ: сетевая ошибка (порт закрыт) — ApiError без ключа, сырой axios error не прицеплен', async () => {
+    const port = await closedPort();
+    for (const secret of SECRET_KEYS) {
+        const client = new ProxySellerUserApi({
+            key: secret, baseUrl: `http://127.0.0.1:${port}/personal/api/v2/`, rateLimit: false
+        });
+        for (const call of [() => client.balance(), () => client.orderMakeResident('1-gb', null, { paymentCode: 'balance' })]) {
+            const error = await caught(call);
+            assert(error instanceof ApiError, `expected ApiError, got ${error && error.name}: ${error && error.message}`);
+            assertEqual([error.code, error.httpStatus], ['ECONNREFUSED', null], 'code / httpStatus');
+            assert(!('cause' in error), `the transport error must not be attached as cause, got ${util.inspect(error.cause)}`);
+            assertNoSecret(secret, error, 'ECONNREFUSED');
+        }
+    }
+});
+
+await check('ключ: тела ответов с путём запроса — Spring 500, HTML 404 в нижнем регистре, HTML 200, конверт, байты', async () => {
+    let mode = null;
+    const server = await loopbackServer((req, res) => {
+        const path = req.url.split('?')[0];
+        const send = (status, type, body) => {
+            res.writeHead(status, { 'Content-Type': type });
+            res.end(body);
+        };
+        switch (mode) {
+            case 'spring':
+                return send(500, 'application/json',
+                    JSON.stringify({ timestamp: '2026-10-01T00:00:00Z', status: 500, error: 'Internal Server Error', path: path }));
+            case 'html404':
+                return send(404, 'text/html', `<html><body><h1>404</h1>Cannot ${req.method} ${path.toLowerCase()}</body></html>`);
+            case 'html200':
+                return send(200, 'text/html', `<html><body>Maintenance: ${decodeURIComponent(path)}</body></html>`);
+            default:
+                return send(200, 'application/json', JSON.stringify({
+                    status: 'error', data: null,
+                    errors: [{ message: `Unknown action ${path}`, code: 0, customData: { [path]: path.toUpperCase() } }]
+                }));
+        }
+    });
+    try {
+        for (const secret of SECRET_KEYS) {
+            const client = new ProxySellerUserApi({ key: secret, baseUrl: server.url, rateLimit: false });
+
+            mode = 'spring';
+            const spring = await caught(() => client.orderMakeResident('1-gb', null, { paymentCode: 'balance' }));
+            assertEqual([spring.httpStatus, spring.message], [500, 'Internal Server Error'], 'Spring 500');
+            assertEqual(spring.errors[0].path, '/personal/api/v2/***/order/make', 'the echoed path keeps its shape');
+            assertNoSecret(secret, spring, 'Spring 500');
+
+            mode = 'html404';
+            const html = await caught(() => client.balance());
+            assertEqual(html.httpStatus, 404, 'HTML 404');
+            assert(String(html.body).includes('/personal/api/v2/***/balance/get'), `masked body expected, got ${html.body}`);
+            assertNoSecret(secret, html, 'HTML 404 (lower case)');
+
+            mode = 'html200';
+            assertNoSecret(secret, await caught(() => client.prolongMake('ipv4', [ADDRESS], '1m')), 'HTML 200 on prolong/make');
+
+            mode = 'envelope';
+            const envelope = await caught(() => client.proxyList());
+            assertEqual(envelope.message, 'Unknown action /personal/api/v2/***/proxy/list', 'envelope message');
+            assertNoSecret(secret, envelope, 'envelope errors');
+
+            // Выгрузка байтами (responseType arraybuffer): тип тела сохраняется, ключ внутри маскируется.
+            mode = 'html404';
+            const geo = await caught(() => client.residentGeo());
+            assert(Buffer.isBuffer(geo.body), `the binary body must stay a Buffer, got ${util.inspect(geo.body)}`);
+            const text = geo.body.toString('utf8');
+            assert(text.includes('/personal/api/v2/***/resident/geo'), `masked bytes expected, got ${text}`);
+            assert(!text.toLowerCase().includes(encodeURIComponent(secret).toLowerCase()), `the key leaks in the bytes: ${text}`);
+        }
+    } finally {
+        await server.close();
+    }
+});
+
+await check('ключ: console.log(api), util.inspect(api) и JSON.stringify(api) его не печатают', () => {
+    for (const secret of SECRET_KEYS) {
+        const client = new ProxySellerUserApi({ key: secret, fingerprint: 'install-1' });
+        client.setPaymentCode('balance');
+        const views = {
+            'util.inspect(api)': util.inspect(client),
+            'util.inspect(api, showHidden)': util.inspect(client, { showHidden: true, depth: Infinity }),
+            'console.log %o': util.format('%o', client),
+            'console.log %j': util.format('%j', client),
+            'JSON.stringify(api)': JSON.stringify(client),
+            'nested in a log record': util.inspect({ record: { client: client } }, { depth: 1 }),
+            'JSON.stringify(record)': JSON.stringify({ record: { client: client } })
+        };
+        for (const [name, text] of Object.entries(views)) {
+            for (const form of [secret, encodeURIComponent(secret)]) {
+                assert(!text.includes(form), `${name} prints the key: ${text}`);
+            }
+        }
+        const json = JSON.parse(JSON.stringify(client));
+        assertEqual(json.baseURL, 'https://proxy-seller.com/personal/api/v2/***/', 'masked baseURL');
+        assertEqual([json.paymentCode, json.fingerprint, json.moneyTimeout], ['balance', 'install-1', 120000], 'settings stay visible');
+        assert(views['util.inspect(api)'].startsWith('ProxySellerUserApi {'), `class name expected, got ${views['util.inspect(api)']}`);
+        // Публичный baseURL не меняется: маска — только в представлении.
+        assert(client.baseURL.endsWith(`/${encodeURIComponent(secret)}/`), `baseURL changed: ${client.baseURL}`);
+    }
+});
+
+/////////////////////////////// строгий успех money / write ///////////////////////////////
+
+// Для money и write успех — ТОЛЬКО конверт со status="success". Ответ без конверта и конверт со
+// status не "success" без errors — ApiError "Unexpected response …": по такому ответу не понять,
+// выполнился ли запрос. read (а с ним все calc) разбирается как раньше.
+
+/** Клиент на подменённом транспорте без очереди: ответы по сценарию, без пауз. */
+function stubClient(reply, config = {}) {
+    const transport = stubTransport(virtualTime(), reply);
+    const client = new ProxySellerUserApi({ key: 'SELFCHECK_KEY', adapter: transport.adapter, rateLimit: false, ...config });
+    return { client: client, transport: transport };
+}
+
+const STRICT_CALLS = [
+    ['order/make', (client) => client.orderMakeResident('1-gb', null, { paymentCode: 'balance' })],
+    ['prolong/make', (client) => client.prolongMake('ipv4', [ADDRESS], '1m')],
+    ['balance/add', (client) => client.balanceAdd(10, 'PAYMENT_ID')],
+    ['auth/add', (client) => client.authAdd('ORDER_NUMBER', 'N')],
+    ['proxy/comment/set', (client) => client.proxyCommentSet([PROXY_ID], 'note')],
+    ['autoprolong/enable', (client) => client.autoProlongEnable('ipv4', [PROXY_ID], '1m', { paymentId: 'balance' })],
+    ['resident/list/delete', (client) => client.residentListDelete(1)]
+];
+
+const NOT_ENVELOPE_ANSWERS = [
+    ['HTML 200', { data: '<!DOCTYPE html><html><body>Maintenance</body></html>', headers: { 'content-type': 'text/html' } }],
+    ['empty 200', { data: '' }],
+    ['204 No Content', { status: 204, data: '' }],
+    ['truncated JSON', { data: '{"status":"success","data":{"orderId":"o1"' }],
+    ['JSON string', { data: '"ok"' }],
+    ['JSON array', { data: '[]' }],
+    ['JSON null', { data: 'null' }],
+    ['object without the envelope', { data: { orderId: 'o1' } }]
+];
+
+const NOT_SUCCESS_ENVELOPES = [
+    ['status error, data, empty errors', { data: { status: 'error', data: { warning: 'Insufficient funds', total: 10, balance: 1 }, errors: [] } }],
+    ['status fail with data', { data: { status: 'fail', data: { orderId: 'ghost' } } }],
+    ['status error without data and errors', { data: { status: 'error', data: null } }]
+];
+
+await check('строгий успех: money/write без конверта — ApiError "Unexpected response", без повтора', async () => {
+    for (const [answerName, answer] of NOT_ENVELOPE_ANSWERS) {
+        for (const [callName, call] of STRICT_CALLS) {
+            const { client, transport } = stubClient(() => answer);
+            const error = await caught(() => call(client));
+            const label = `${callName} / ${answerName}`;
+            assert(error instanceof ApiError, `${label}: expected ApiError, got ${error && error.name}: ${error && error.message}`);
+            assert(error.message.startsWith(`Unexpected response from ${callName}`), `${label}: ${error.message}`);
+            assert(error.message.includes('no JSON envelope') && error.message.includes('check before retrying'),
+                `${label}: ${error.message}`);
+            assertEqual(error.httpStatus, answer.status || 200, `${label}: httpStatus`);
+            assertEqual(typeof error.body, 'string', `${label}: body is the start of the response`);
+            assertEqual(transport.log.length, 1, `${label}: must not be retried`);
+        }
+    }
+});
+
+await check('строгий успех: money/write с конвертом не "success" и без errors — ApiError, data в error.body', async () => {
+    for (const [answerName, answer] of NOT_SUCCESS_ENVELOPES) {
+        for (const [callName, call] of STRICT_CALLS) {
+            const { client } = stubClient(() => answer);
+            const error = await caught(() => call(client));
+            const label = `${callName} / ${answerName}`;
+            assert(error instanceof ApiError, `${label}: expected ApiError, got ${error && error.name}: ${error && error.message}`);
+            assert(error.message.startsWith(`Unexpected response from ${callName}`) &&
+                error.message.includes(`status ${JSON.stringify(answer.data.status)} without errors`), `${label}: ${error.message}`);
+            assertEqual(error.body, answer.data, `${label}: the envelope must stay in error.body`);
+        }
+    }
+});
+
+await check('строгий успех: тело без конверта обрезано до 500 символов и без ключа', async () => {
+    const secret = SECRET_KEYS[0];
+    const transport = stubTransport(virtualTime(), (config) => ({
+        data: `<html>${config.baseURL}${config.url} ${'x'.repeat(5000)}</html>`, headers: { 'content-type': 'text/html' }
+    }));
+    const client = new ProxySellerUserApi({ key: secret, adapter: transport.adapter, rateLimit: false });
+    const error = await caught(() => client.orderMakeResident('1-gb', null, { paymentCode: 'balance' }));
+    assert(error.body.length <= 501 && error.body.endsWith('…'), `truncated body expected, got ${error.body.length} chars`);
+    assert(error.body.startsWith('<html>https://proxy-seller.com/personal/api/v2/***/order/make'), `masked body expected: ${error.body.slice(0, 80)}`);
+    assertNoSecret(secret, error, 'truncated body');
+});
+
+await check('строгий успех: success, errors[] и delete-ручки работают как раньше', async () => {
+    const { client } = stubClient((config) => {
+        switch (config.url) {
+            case 'resident/list/delete': return { data: { status: 'success', data: 'delete', errors: [] } };
+            case 'residentsubuser/list/delete': return { data: { status: 'success', data: '{"status":"not-found"}', errors: [] } };
+            case 'residentsubuser/delete': return { data: { status: 'success', data: null, errors: [] } };
+            case 'proxy/comment/set': return { data: { status: 'success', data: { updated: 2 }, errors: [] } };
+            case 'prolong/make/ipv4': return { data: { status: 'error', data: { warning: 'w', total: 10, balance: 1 }, errors: [{ code: 16, message: 'Insufficient funds on balance' }] } };
+            default: return { data: { status: 'success', data: { orderId: ORDER_ID }, errors: [] } };
+        }
+    });
+    assertEqual(await client.orderMakeResident('1-gb', null, { paymentCode: 'balance' }), { orderId: ORDER_ID }, 'order/make success');
+    assertEqual(await client.proxyCommentSet([PROXY_ID], 'note'), 2, 'proxy/comment/set success');
+    assertEqual(await client.residentListDelete(1), { status: 'delete' }, 'resident/list/delete');
+    assertEqual(await client.residentSubUserListDelete('PACKAGE_KEY', 1), { status: 'not-found' }, 'not-found is still a result');
+    assertEqual(await client.residentSubUserDelete('PACKAGE_KEY'), {}, 'residentsubuser/delete with null data');
+    const error = await caught(() => client.prolongMake('ipv4', [ADDRESS], '1m'));
+    assertEqual([error.code, error.message], [16, 'Insufficient funds on balance'], 'a business error stays as it was');
+    assertEqual(error.body.data, { warning: 'w', total: 10, balance: 1 }, 'calc data stays in error.body.data');
+});
+
+await check('строгий успех: read и calc не тронуты — нехватка средств у calc отдаёт data, выгрузки и не-конверты как раньше', async () => {
+    const shortOfMoney = { status: 'error', data: { warning: 'Insufficient funds. Total $10. Not enough $9', total: 10, balance: 1 }, errors: [] };
+    const { client } = stubClient((config) => {
+        if (config.url.startsWith('proxy/download/')) {
+            return { data: '1.2.3.4:8000:login:password\n', headers: { 'content-type': 'text/plain', 'content-disposition': 'attachment; filename=p.txt' } };
+        }
+        if (config.url === 'proxy/list') {
+            return { data: { items: [] } };
+        }
+        return { data: shortOfMoney };
+    });
+    assertEqual(await client.prolongCalc('ipv4', [ADDRESS], '1m'), shortOfMoney.data, 'prolong/calc');
+    assertEqual(await client.autoProlongCalc('ipv4', [ADDRESS], '1m', { paymentId: 'balance' }), shortOfMoney.data, 'autoprolong/calc');
+    assertEqual(await client.orderCalcResident('1-gb'), shortOfMoney.data, 'order/calc');
+    assertEqual(await client.proxyDownload('ipv4', 'txt'), '1.2.3.4:8000:login:password\n', 'a text export');
+    assertEqual(await client.proxyList(), { items: [] }, 'a read without the envelope is returned as before');
+});
+
+/////////////////////////////// таймаут денежных запросов ///////////////////////////////
+
+// money (order/make, prolong/make, balance/add) — свой таймаут, 120 с по умолчанию; остальные — общий,
+// 30 с. Явно заданный общий timeout — нижняя граница для money: max(timeout, moneyTimeout).
+
+/** Таймаут, с которым каждый путь ушёл в транспорт: { 'order/make': [120000], … }. */
+async function timeoutsByUrl(config, calls) {
+    const seen = {};
+    const { client } = stubClient((request) => {
+        (seen[request.url] = seen[request.url] || []).push(request.timeout);
+        return {};
+    }, config);
+    for (const call of calls) {
+        await call(client);
+    }
+    return { client: client, seen: seen };
+}
+
+await check('таймаут: money — 120 с по умолчанию, read и write — 30 с; timeout в options вызова главнее', async () => {
+    const { client, seen } = await timeoutsByUrl({}, [
+        (c) => c.orderMakeResident('1-gb', null, { paymentCode: 'balance' }),
+        (c) => c.prolongMake('ipv4', [ADDRESS], '1m'),
+        (c) => c.balanceAdd(10, 'PAYMENT_ID'),
+        (c) => c.authAdd('ORDER_NUMBER', 'N'),
+        (c) => c.autoProlongEnable('ipv4', [PROXY_ID], '1m', { paymentId: 'balance' }),
+        (c) => c.orderCalcResident('1-gb'),
+        (c) => c.proxyList(),
+        (c) => c.request('post', 'order/make', { data: {}, timeout: 5000 })
+    ]);
+    assertEqual([client.timeout, client.moneyTimeout], [30000, 120000], 'defaults');
+    assertBody(seen, {
+        'order/make': [120000, 5000],
+        'prolong/make/ipv4': [120000],
+        'balance/add': [120000],
+        'auth/add': [30000],
+        'autoprolong/enable/ipv4': [30000],
+        'order/calc': [30000],
+        'proxy/list': [30000]
+    }, 'timeouts per request');
+});
+
+await check('таймаут: явный общий timeout — нижняя граница для money; 0 — без таймаута', async () => {
+    const cases = [
+        [{ timeout: 15000 }, 120000, 15000],
+        [{ timeout: 300000 }, 300000, 300000],
+        [{ moneyTimeout: 60000 }, 60000, 30000],
+        [{ moneyTimeout: 10000 }, 10000, 30000],                  // общий не задан — свой money
+        [{ timeout: 30000, moneyTimeout: 10000 }, 30000, 30000],  // общий задан явно — max
+        [{ timeout: 0 }, 0, 0],
+        [{ moneyTimeout: 0, timeout: 5000 }, 0, 5000],
+        [{ moneyTimeout: null }, 120000, 30000]
+    ];
+    for (const [config, money, other] of cases) {
+        const { client, seen } = await timeoutsByUrl(config, [
+            (c) => c.orderMakeResident('1-gb', null, { paymentCode: 'balance' }),
+            (c) => c.proxyList()
+        ]);
+        assertEqual([client.moneyTimeout, seen['order/make'][0], seen['proxy/list'][0]], [money, money, other],
+            JSON.stringify(config));
+    }
+});
+
+await check('таймаут: неверный moneyTimeout — ApiError из конструктора; в axios он не уходит', async () => {
+    for (const moneyTimeout of [-1, '120000', NaN, Infinity, 2147483648, {}, true]) {
+        await expectApiError(() => new ProxySellerUserApi({ key: 'k', moneyTimeout: moneyTimeout }), 'moneyTimeout');
+    }
+    const client = new ProxySellerUserApi({ key: 'k', moneyTimeout: 90000 });
+    assertEqual(client.client.defaults.moneyTimeout, undefined, 'moneyTimeout must not reach axios');
+    assertEqual(client.client.defaults.timeout, 30000, 'the general timeout is the axios default');
+});
+
+await check('таймаут: на настоящем сокете money ждёт дольше общего timeout, read обрывается по нему', async () => {
+    const server = await loopbackServer((req, res) => {
+        setTimeout(() => {
+            if (res.socket && !res.socket.destroyed) {
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ status: 'success', data: { orderId: ORDER_ID }, errors: [] }));
+            }
+        }, 400);
+    });
+    try {
+        const client = new ProxySellerUserApi({
+            key: SECRET_KEYS[0], baseUrl: server.url, timeout: 100, moneyTimeout: 3000, rateLimit: false
+        });
+        assertEqual(await client.orderMakeResident('1-gb', null, { paymentCode: 'balance' }), { orderId: ORDER_ID },
+            'order/make must outlive the general timeout');
+        const error = await caught(() => client.proxyList());
+        assert(error instanceof ApiError, `expected ApiError, got ${error && error.name}`);
+        assertEqual([error.code, error.message], ['ECONNABORTED', 'timeout of 100ms exceeded'], 'a read times out on the general timeout');
+    } finally {
+        await server.close();
+    }
+});
+
+/////////////////////////////// зависимости ///////////////////////////////
+
+await check('package.json: axios ^1.19.0, и установленный axios ему соответствует', () => {
+    const manifest = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+    assertEqual(manifest.dependencies.axios, '^1.19.0', 'axios range');
+    const [major, minor] = String(axios.VERSION).split('.').map(Number);
+    assert(major === 1 && minor >= 19, `installed axios ${axios.VERSION} does not satisfy ^1.19.0`);
 });
 
 /////////////////////////////// итог ///////////////////////////////
