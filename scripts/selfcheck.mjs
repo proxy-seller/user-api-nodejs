@@ -791,6 +791,24 @@ await check('autoprolong: scraper и вызов без платёжки отби
     assertEqual(calls.length, 0, 'no request may be sent');
 });
 
+await check('autoprolong: paddle_subscription без subscriptionId уходит на сервер', async () => {
+    // С одной привязанной картой сервер берёт её сам, а сколько карт на аккаунте, знает только он.
+    const client = new ProxySellerUserApi({ key: 'k' });
+    const byId = await captureRequest(client,
+        () => client.autoProlongEnable('ipv4', [PROXY_ID], '1m', { paymentId: 'paddle_subscription' }));
+    assertBody(byId[0].options.data, { paymentId: 'paddle_subscription', ids: [PROXY_ID], periodId: '1m' });
+
+    client.setPaymentCode('paddle_subscription');
+    const byCode = await captureRequest(client, () => client.autoProlongCalc('resident'));
+    assertEqual(byCode[0].uri, 'autoprolong/calc/resident', 'resident calc path');
+    assertBody(byCode[0].options.data, { paymentCode: 'paddle_subscription' }, 'resident calc body');
+
+    const chosen = await captureRequest(client,
+        () => client.autoProlongEnable('ipv6', [ORDER_ID], '1m', { subscriptionId: 'sub_1' }));
+    assertBody(chosen[0].options.data,
+        { paymentCode: 'paddle_subscription', subscriptionId: 'sub_1', orderIds: [ORDER_ID], periodId: '1m' });
+});
+
 await check('order/calc mix: код пакета уезжает в mixId', () => {
     const payload = prolongClient.prepareMix('europe-2-mix_IPv4', '1m', 10, null, null, null);
     assertEqual(payload.mixId, 'europe-2-mix_IPv4', 'mixId lost');

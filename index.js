@@ -1882,7 +1882,9 @@ class ProxySellerUserApi {
      * Платёжка для calc/enable ОБЯЗАТЕЛЬНА — в отличие от prolong/*, где её можно не слать:
      * списание произойдёт без клиента, и «по умолчанию с баланса» было бы догадкой за него.
      * Сервер отвечает "Set [paymentId]"; проверяем локально, раз остальные обязательные поля
-     * SDK уже проверяет. Принимаются только balance и paddle_subscription.
+     * SDK уже проверяет. Принимаются только balance и paddle_subscription. subscriptionId не
+     * спрашиваем: с одной привязанной картой сервер берёт её сам, а сколько карт на аккаунте,
+     * видно только ему ("Set [subscriptionId]", если их несколько).
      * @param {object} payload
      * @param {string} action
      * @throws ApiError
@@ -1896,7 +1898,7 @@ class ProxySellerUserApi {
             `autoprolong/${action} requires a payment system (the server answers "Set [paymentId]"): ` +
             'the charge happens while you are away, so it cannot be guessed. Pass paymentId / ' +
             'paymentCode or set it once with setPaymentId() / setPaymentCode(); only balance and ' +
-            'paddle_subscription are accepted, and paddle_subscription also needs subscriptionId.'
+            'paddle_subscription are accepted.'
         );
     }
 
@@ -1952,7 +1954,8 @@ class ProxySellerUserApi {
      * @param {array|string|object} ipsOrIds выбор, как у autoProlongCalc(); для type='resident' —
      *        null (любой непустой выбор — локальная ApiError)
      * @param {string} periodId ObjectId or period code (e.g. '1m'); резидентке не нужен
-     * @param {object} options subscriptionId (обязателен для paddle_subscription), tarifId,
+     * @param {object} options subscriptionId (при paddle_subscription, если привязанных карт
+     *        несколько; единственную карту сервер берёт сам), tarifId,
      *        ids / ips / orderIds, paymentId/paymentCode
      * @return object
      * @throws ApiError при type='scraper', без платёжки и в тех же случаях выбора, что у
