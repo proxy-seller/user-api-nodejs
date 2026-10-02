@@ -682,10 +682,17 @@ class ProxySellerUserApi {
      * Это значение клиента ПО УМОЛЧАНИЮ: платёжка, переданная в самом вызове (paymentId или
      * paymentCode в options либо в объектной форме), главнее — тогда пара клиента в запрос не
      * попадает вовсе, ни id, ни code (см. _paymentLevel()).
+     *
+     * setPaymentId() и setPaymentCode() вытесняют друг друга: выигрывает последний вызов, как в
+     * Java, PHP и Go. Раньше код клиента был старше id, и setPaymentId('balance') после
+     * setPaymentCode('paddle_subscription') оставлял оплату привязанной картой.
      * @param string id
      */
     setPaymentId(id) {
         this.paymentId = id
+        if (id != null) {
+            this.paymentCode = null
+        }
     }
 
     getPaymentId() {
@@ -699,9 +706,13 @@ class ProxySellerUserApi {
      * balance/add does not resolve codes and needs setPaymentId().
      *
      * Как и setPaymentId(), это значение по умолчанию: платёжка вызова его вытесняет целиком.
+     * Сбрасывает setPaymentId(): выигрывает последний из двух вызовов (см. setPaymentId).
      */
     setPaymentCode(code) {
         this.paymentCode = code
+        if (code != null) {
+            this.paymentId = null
+        }
     }
 
     getPaymentCode() {

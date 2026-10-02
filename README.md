@@ -48,8 +48,10 @@ server rejects it. A single call can pass `{ paymentCode: 'balance' }` in its op
 call wins.** When a call passes a non-empty `paymentCode` or `paymentId` — in its options or in
 the object form — the client's default is left out of that request entirely: neither its code nor
 its id is sent. Only a call that passes neither uses the default (an empty `''` / `null` in the
-call does not wipe it). Within one level the code still beats the id, exactly as the server reads
-them.
+call does not wipe it). Within one call the code still beats the id, exactly as the server reads
+them. The two setters replace each other — the last one called wins, as in the Java, PHP and Go
+SDKs: `setPaymentCode('paddle_subscription')` followed by `setPaymentId('balance')` pays from the
+balance.
 
 ```js
 api.setPaymentCode('paddle_subscription');
@@ -782,6 +784,10 @@ const geo = JSON.parse(Buffer.from(await api.residentGeo()).toString('utf8'));
   and the mobile `rotationId` stays a number of minutes.
 - `authActive(id, "Y")` became `authChange(id, true)`.
 - `ping()` and `proxyCheck()` have no v2 equivalent.
+- There is no default payment system. 1.x sent `paymentId: 1` on orders and `29` from
+  `balanceAdd()` — v1 numeric ids that v2 refuses (`Incorrect payment system`). Call
+  `setPaymentCode('balance')` (or `'paddle_subscription'`) or pass the payment per call;
+  `balanceAdd()` takes an id from `balancePaymentsList()`.
 - `residentListDelete()` sends the ID in the request body.
 - Delete endpoints return their payload as a string (`"delete"`, or JSON such as
   `{"status":"not-found"}` inside a successful envelope). The SDK normalises it to an object,
@@ -800,6 +806,11 @@ Changes made after the 2.0 release, in the order the server shipped them:
   pair out of that request entirely. Before, the two levels were merged and the client's code beat
   the call's id: `setPaymentCode('paddle_subscription')` plus `{ paymentId: 'balance' }` charged
   the card. See [Paying for orders](#paying-for-orders).
+- **2.0.1: the two payment setters replace each other.** `setPaymentId()` after
+  `setPaymentCode()`, or the other way round, switches the client's default: the last call wins,
+  as in the Java, PHP and Go SDKs. Before, the code outlived a later `setPaymentId()`, so
+  `setPaymentCode('paddle_subscription')` followed by `setPaymentId('balance')` still charged the
+  saved card.
 - **Behaviour change: money and write requests succeed only on `status: "success"`.** A 2xx answer
   without the envelope (an HTML page, an empty body, `204`, truncated JSON) or an envelope with
   another `status` and no `errors` used to be returned as the result — `orderMake()` could

@@ -1,6 +1,6 @@
 {
     "name": "proxy-seller-user-api",
-    "version": "2.0.0",
+    "version": "2.0.1",
     "description": "Interaction with user api",
     "main": "index.js",
     "type": "module",
