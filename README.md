@@ -3,13 +3,17 @@
 Client library for Proxy-Seller Client API v2.
 
 ```sh
-npm i proxy-seller-user-api
+npm i @proxyseller/user-api
 ```
+
+The v2 client is published as `@proxyseller/user-api`. The old package `proxy-seller-user-api`
+(1.x) is the client for `/personal/api/v1/` and does not receive v2 releases — see
+[v1 migration notes](#v1-migration-notes).
 
 ## Quick start
 
 ```js
-import ProxySellerUserApi, { ApiError } from 'proxy-seller-user-api';
+import ProxySellerUserApi, { ApiError } from '@proxyseller/user-api';
 
 const api = new ProxySellerUserApi({
   key: 'YOUR_API_KEY',
@@ -780,6 +784,8 @@ const geo = JSON.parse(Buffer.from(await api.residentGeo()).toString('utf8'));
 
 ## v1 migration notes
 
+- The package name changed: `npm uninstall proxy-seller-user-api && npm i @proxyseller/user-api`,
+  and import from `'@proxyseller/user-api'` instead of `'proxy-seller-user-api'`.
 - IDs in v2 are strings; old numeric v1 IDs do not resolve. Resident list ids stay numeric,
   and the mobile `rotationId` stays a number of minutes.
 - `authActive(id, "Y")` became `authChange(id, true)`.
