@@ -390,6 +390,27 @@ await check('proxyDownload: package_key на type=resident падает лока
         'subresident'
     ));
 
+await check('proxyDownloadResident: protocol и host уходят в query, proto — нет', async () => {
+    const calls = await captureRequest(api,
+        () => api.proxyDownloadResident('561', 'txt', 10, 'socks5', 'us.res.proxy-seller.com'), '');
+    assertEqual(calls[0].uri, 'proxy/download/resident');
+    assertBody(calls[0].options.params,
+        { id: '561', ext: 'txt', maxLine: 10, protocol: 'socks5', host: 'us.res.proxy-seller.com' });
+});
+
+await check('proxyDownloadResident: без protocol и host запрос прежний', async () => {
+    const calls = await captureRequest(api, () => api.proxyDownloadResident('561', 'txt', 10), '');
+    assertBody(calls[0].options.params, { id: '561', ext: 'txt', maxLine: 10 });
+});
+
+await check('proxyDownload: protocol и host для subresident уходят через filters', async () => {
+    const calls = await captureRequest(api, () => api.proxyDownload('subresident', 'txt', null, null,
+        { package_key: 'KEY', protocol: 'http', host: 'asia.res.proxy-seller.com' }), '');
+    assertEqual(calls[0].uri, 'proxy/download/subresident');
+    assertBody(calls[0].options.params,
+        { ext: 'txt', package_key: 'KEY', protocol: 'http', host: 'asia.res.proxy-seller.com' });
+});
+
 /////////////////////////////// ApiError ///////////////////////////////
 
 await check('ApiError: весь массив errors доступен', () => {

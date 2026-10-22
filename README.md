@@ -730,9 +730,22 @@ await api.proxyDownload('subresident', 'txt', null, null, { package_key: 'PACKAG
 ```
 
 `package_key` works **only** on `proxy/download/subresident`. The literal
-`/proxy/download/resident` route knows only `listId` / `id` / `ext` / `maxLine` and silently
-ignores `package_key` — you would get the parent package's export back. The SDK throws locally
-on that combination instead.
+`/proxy/download/resident` route knows only `listId` / `id` / `ext` / `maxLine` / `protocol` /
+`host` and silently ignores `package_key` — you would get the parent package's export back. The
+SDK throws locally on that combination instead.
+
+Residential lines take the connection scheme in `protocol` (`http` or `socks5`) and the gateway
+in `host`. With `txt` a line becomes `socks5://login:password@host:port`, `csv` keeps its
+columns, and a custom template gets the value in `%protocol%`; without `protocol` the lines have
+no scheme, as before. Login, password and ports are the same for both protocols. `socks5` also
+carries UDP and HTTP/3 (QUIC) to websites. Gateways: `res.proxy-seller.com` (Europe, the
+default), `us.res.proxy-seller.com`, `asia.res.proxy-seller.com` — pick the one closest to your
+server. This is not `proto`, which selects IPv4 ports:
+
+```js
+await api.proxyDownloadResident('LIST_ID', 'txt', 1000, 'socks5', 'us.res.proxy-seller.com');
+await api.proxyDownload('subresident', 'txt', null, null, { package_key: 'PACKAGE_KEY', protocol: 'http' });
+```
 
 ## Resident and subuser lists
 
@@ -807,6 +820,11 @@ const geo = JSON.parse(Buffer.from(await api.residentGeo()).toString('utf8'));
 
 Changes made after the 2.0 release, in the order the server shipped them:
 
+- **Unreleased: `protocol` and `host` in residential exports.** `proxyDownloadResident(id, ext,
+  maxLine, protocol, host)` and the `protocol` / `host` filters of `proxyDownload('subresident',
+  …)` put the connection scheme (`http` / `socks5`) and the gateway into the lines. Without them
+  the request and the lines are the same as before. See
+  [Exports are files, not JSON](#exports-are-files-not-json).
 - **Behaviour change: the payment system of a call replaces the client's default.** A non-empty
   `paymentId` or `paymentCode` passed in a call leaves the `setPaymentId()` / `setPaymentCode()`
   pair out of that request entirely. Before, the two levels were merged and the client's code beat

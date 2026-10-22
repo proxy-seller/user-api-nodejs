@@ -2408,12 +2408,14 @@ class ProxySellerUserApi {
      * @param string ext - txt | csv либо свой шаблон строки
      * @param string proto - https | socks5
      * @param string listId - только для резидентских выгрузок; не задан — отдаются IP всех листов
-     * @param {*} filters country | ends | package_key
+     * @param {*} filters country | ends | package_key | protocol | host
      *        package_key работает ТОЛЬКО на type='subresident'. Литеральный маршрут
-     *        /proxy/download/resident знает лишь listId|id|ext|maxLine, а package_key молча
-     *        игнорирует и отдаёт выгрузку РОДИТЕЛЬСКОГО пакета. По той же причине при
-     *        type='resident' молча выбрасываются proto, country и ends — для резидентки
-     *        берите proxyDownloadResident(), у неё есть maxLine.
+     *        /proxy/download/resident знает лишь listId|id|ext|maxLine|protocol|host, а
+     *        package_key молча игнорирует и отдаёт выгрузку РОДИТЕЛЬСКОГО пакета. По той же
+     *        причине при type='resident' молча выбрасываются proto, country и ends — для
+     *        резидентки берите proxyDownloadResident(), у неё есть maxLine.
+     *        protocol (http | socks5) и host (шлюз) — схема и шлюз в строках резидентов,
+     *        только resident и subresident; см. proxyDownloadResident(). Это не proto.
      * @return string
      * @throws ApiError при package_key вместе с type='resident'
      */
@@ -2439,10 +2441,19 @@ class ProxySellerUserApi {
      *        query-параметр `id` — сервер принимает его как алиас к `listId`
      * @param string ext - txt | csv
      * @param integer maxLine
+     * @param string protocol - http | socks5: при txt строка становится
+     *        `socks5://login:password@host:port`, csv не меняется, свой шаблон получает его в
+     *        %protocol%; не задан — строки без схемы, как раньше. Логин, пароль и порты у обоих
+     *        протоколов одни; socks5 несёт ещё UDP и HTTP/3 (QUIC) к сайтам. Не путать с proto
+     *        у proxyDownload(): тот выбирает порты IPv4
+     * @param string host - шлюз: res.proxy-seller.com (по умолчанию), us.res.proxy-seller.com,
+     *        asia.res.proxy-seller.com
      * @return string
      */
-    async proxyDownloadResident(id = null, ext = null, maxLine = null) {
-        const params = this.filterEmpty({ id: id, ext: this.assertExt(ext), maxLine: maxLine });
+    async proxyDownloadResident(id = null, ext = null, maxLine = null, protocol = null, host = null) {
+        const params = this.filterEmpty({
+            id: id, ext: this.assertExt(ext), maxLine: maxLine, protocol: protocol, host: host
+        });
         return this.request('get', 'proxy/download/resident', { params: params });
     }
 
